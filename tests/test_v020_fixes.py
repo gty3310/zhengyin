@@ -33,17 +33,26 @@ class V020Fixes(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_1_wei_common_reading_retained(self):
+        # v0.3.0 supersedes the v0.2.0 exemption: wei2 is locked by the
+        # user's pinyin, != default wei4, and is a common reading — it
+        # now goes to a grouped question instead of being retained.
         r = self.engine.convert("為人君，止於仁",
                                 pinyin="wei2 ren2 jun1 zhi3 yu2 ren2".split())
-        self.assertEqual(r.status, "ok", r.questions)
-        self.assertEqual(r.output, "為人君，止於仁")
-        self.assertFalse([c for c in r.changes if c["char"] == "為"], r.changes)
+        self.assertEqual(r.status, "questions", r)
+        qs = [q for q in r.questions if q["char"] == "為"]
+        self.assertEqual(len(qs), 1, r.questions)
+        self.assertTrue(qs[0].get("group"), qs[0])
+        self.assertEqual(qs[0]["target_reading"], "wei2")
 
     def test_2_xing_common_reading_retained(self):
+        # v0.3.0: same boundary change as test_1 (xing1 locked, common,
+        # != default xing4) — grouped question, not silent retention.
         r = self.engine.convert("民興孝", pinyin="min2 xing1 xiao4".split())
-        self.assertEqual(r.status, "ok", r.questions)
-        self.assertEqual(r.output, "民興孝")
-        self.assertFalse([c for c in r.changes if c["char"] == "興"], r.changes)
+        self.assertEqual(r.status, "questions", r)
+        qs = [q for q in r.questions if q["char"] == "興"]
+        self.assertEqual(len(qs), 1, r.questions)
+        self.assertTrue(qs[0].get("group"), qs[0])
+        self.assertEqual(qs[0]["target_reading"], "xing1")
 
     def test_3_bu_tone_normalised_raw_preserved(self):
         r = self.engine.convert("聽而不聞", pinyin="ting1 er2 bu2 wen2".split())
@@ -88,9 +97,15 @@ class V020Fixes(unittest.TestCase):
             self.assertIn("節彼", r.output)
 
     def test_7a_hao_common_reading_retained(self):
+        # v0.3.0: hao4 locked + common + != default — the two 好 now
+        # merge into a single grouped question (occurrences=2).
         r = self.engine.convert("好好色", pinyin="hao4 hao4 se4".split())
-        self.assertEqual(r.status, "ok", r.questions)
-        self.assertEqual(r.output, "好好色")
+        self.assertEqual(r.status, "questions", r)
+        self.assertEqual(len(r.questions), 1, r.questions)
+        q = r.questions[0]
+        self.assertEqual(q["char"], "好")
+        self.assertTrue(q.get("group"), q)
+        self.assertEqual(len(q["occurrences"]), 2, q)
 
     def test_7b_le_yao_still_asks(self):
         r = self.engine.convert("有所好樂", pinyin="you3 suo3 hao4 yao4".split())

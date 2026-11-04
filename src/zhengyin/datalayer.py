@@ -88,6 +88,38 @@ class Dict:
             for r in con.execute("SELECT * FROM substitutes"):
                 d = dict(r)
                 self.substitutes[d["reading"]] = json.loads(d.get("candidates") or "[]")
+
+            # prescribed (指定替字): tolerant — an older db without the
+            # table is treated as an empty prescribed layer.
+            self.prescribed_single: dict[tuple[str, str], dict] = {}
+            self.prescribed_phrases: list[dict] = []
+            tables = {r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            if "prescribed" in tables:
+                for r in con.execute("SELECT * FROM prescribed"):
+                    d = dict(r)
+                    for k in ("key", "reading", "substitute", "note",
+                              "src", "src_ref", "verified"):
+                        d.setdefault(k, "")
+                        if d[k] is None:
+                            d[k] = ""
+                    key = d["key"]
+                    if not key or not d["substitute"]:
+                        continue
+                    if len(key) == 1 and " " not in d["reading"]:
+                        self.prescribed_single[
+                            (self.canonical(key), d["reading"])] = d
+                    elif len(key) > 1:
+                        readings = d["reading"].split()
+                        if len(readings) != len(key):
+                            continue
+                        if len(d["substitute"]) != len(key):
+                            continue
+                        d = dict(d)
+                        d["_canon"] = "".join(self.canonical(c) for c in key)
+                        d["_readings"] = readings
+                        self.prescribed_phrases.append(d)
+                self.prescribed_phrases.sort(key=lambda e: -len(e["key"]))
         finally:
             con.close()
 
@@ -137,6 +169,10 @@ class Dict:
 
     def podu_entries(self, ch: str) -> list[dict]:
         return list(self.podu.get(self.canonical(ch), []))
+
+    def prescribed_for(self, ch: str, reading: str) -> dict | None:
+        """Single-char prescribed substitute for (char, reading), if any."""
+        return self.prescribed_single.get((self.canonical(ch), reading))
 
     def best_substitute(self, reading: str) -> str | None:
         """Safest same-sound replacement for ``reading``.

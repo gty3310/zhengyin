@@ -65,10 +65,52 @@ class LearnStore:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         return entry
 
+    def match_group(self, char: str, reading: str) -> dict | None:
+        """Latest group ruling for (char, reading), if any."""
+        for e in reversed(self.entries):
+            if e.get("scope") != "group":
+                continue
+            if e.get("char") == char and e.get("reading") == reading:
+                return e
+        return None
+
+    def add_group(self, char: str, reading: str, action: str,
+                  substitute: str | None = None,
+                  src: str = "user-answer") -> dict:
+        """Record (or replace) a group ruling for (char, reading)."""
+        entry = {
+            "char": char,
+            "reading": reading,
+            "action": action,
+            "scope": "group",
+            "src": src,
+            "verified": "user_confirmed",
+            "date": date.today().isoformat(),
+        }
+        if action == "substitute" and substitute:
+            entry["substitute"] = substitute
+        # replace any prior group ruling for the same char+reading
+        self.entries = [
+            e for e in self.entries
+            if not (e.get("scope") == "group" and e.get("char") == char
+                    and e.get("reading") == reading)
+        ]
+        self.entries.append(entry)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        return entry
+
     def export_dict_format(self) -> list[dict]:
-        """Render entries as zhengyin-dict tongjia-format records."""
+        """Render entries as zhengyin-dict tongjia-format records.
+
+        Only context entries are exported; group rulings (scope=group)
+        are a local adjudication layer, not dictionary tongjia records.
+        """
         out = []
         for e in self.entries:
+            if e.get("scope") == "group":
+                continue
             out.append({
                 "char": e.get("char", ""),
                 "benzi": e.get("substitute", ""),

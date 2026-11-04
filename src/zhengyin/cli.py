@@ -102,6 +102,44 @@ def cmd_data_status(args) -> int:
 # ----------------------------------------------------------------------
 # convert
 # ----------------------------------------------------------------------
+def load_rulings(path, learned: LearnStore, engine: Engine) -> None:
+    """Load --rulings JSON into the learned layer as group rulings.
+
+    Format: {"rulings": [{"char", "reading", "action",
+    "substitute"?}]} with action in substitute|ssml|keep. Substitute
+    rulings are validated like user answers before anything is stored;
+    a failed validation raises ValueError (caller exits 1).
+    """
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    rulings = data.get("rulings") if isinstance(data, dict) else data
+    if not isinstance(rulings, list):
+        raise ValueError("rulings 文件格式应为 {\"rulings\": [...]}")
+    # Two passes: validate everything first, then write group records.
+    parsed = []
+    for r in rulings:
+        char = r.get("char", "")
+        reading = r.get("reading", "")
+        action = r.get("action", "")
+        if len(char) != 1 or not reading:
+            raise ValueError(f"rulings 条目缺单字 char 或 reading：{r}")
+        if action not in ("substitute", "ssml", "keep"):
+            raise ValueError(
+                f"rulings 条目 action 须为 substitute/ssml/keep：{r}")
+        substitute = r.get("substitute")
+        if action == "substitute":
+            if not substitute:
+                raise ValueError(f"rulings 替字条目缺 substitute：{r}")
+            ok, _eff, fail = engine._validate_answer(substitute, reading)
+            if not ok:
+                raise ValueError(
+                    f"rulings 替字未通过校验（{char} {reading} → "
+                    f"{substitute}）：{fail}")
+        parsed.append((char, reading, action, substitute))
+    for char, reading, action, substitute in parsed:
+        learned.add_group(char, reading, action, substitute,
+                          src="user-ruling")
+
+
 def cmd_convert(args) -> int:
     d = load_dict(args.db)
     text = Path(args.input).read_text(encoding="utf-8")
@@ -114,6 +152,12 @@ def cmd_convert(args) -> int:
         answers = json.loads(Path(args.answers).read_text(encoding="utf-8"))
     learned = LearnStore()
     engine = Engine(d, learned)
+    if getattr(args, "rulings", None):
+        try:
+            load_rulings(args.rulings, learned, engine)
+        except (ValueError, OSError, json.JSONDecodeError) as e:
+            print(f"错误：{e}", file=sys.stderr)
+            return 1
     try:
         result = engine.convert(text, pinyin=pinyin, answers=answers)
     except ValueError as e:
@@ -128,8 +172,10 @@ def cmd_convert(args) -> int:
             "status": "questions",
             "questions_file": str(qpath),
             "question_count": len(result.questions),
-            "hint": "请用户逐条作答（每条一个现代汉字），写入 answers.json "
-                    "（{\"q0\": \"字\", ...}）后以 --answers 重跑本命令。",
+            "hint": "请用户逐条作答（每条一个现代汉字；组问题可答替字、"
+                    "\"ssml\" 钉音或 \"keep\" 保留原字，一组一答），写入 "
+                    "answers.json（{\"q0\": \"字\", ...}）后以 --answers "
+                    "重跑本命令。",
         }, ensure_ascii=False))
         return 2
 
@@ -154,6 +200,17 @@ def cmd_convert(args) -> int:
             lines.append(py)
         ppath.write_text("\n".join(lines) + "\n", encoding="utf-8")
         summary["pinyin_file"] = str(ppath)
+    if getattr(args, "ssml", None):
+        spath = Path(args.ssml)
+        spath.write_text(result.ssml_output, encoding="utf-8")
+        summary["ssml_file"] = str(spath)
+        summary["ssml_hints"] = len(result.ssml_hints)
+    if getattr(args, "ssml_hints", None):
+        hpath = Path(args.ssml_hints)
+        hpath.write_text(json.dumps(result.ssml_hints,
+                                    ensure_ascii=False, indent=2),
+                         encoding="utf-8")
+        summary["ssml_hints_file"] = str(hpath)
     print(json.dumps(summary, ensure_ascii=False))
     return 0
 
@@ -235,7 +292,10 @@ def main(argv: list[str] | None = None) -> int:
     p_conv.add_argument("--pinyin-out", help="拼音对照 TXT 路径")
     p_conv.add_argument("--changes", help="逐字转换清单 JSON 输出路径")
     p_conv.add_argument("--questions", help="问题清单 JSON 输出路径（默认 ./questions.json）")
-    p_conv.add_argument("--answers", help="用户答案 JSON（{\"q0\": \"字\"}）")
+    p_conv.add_argument("--answers", help="用户答案 JSON（{\"q0\": \"字\"}；组问题可答替字、\"ssml\" 或 \"keep\"）")
+    p_conv.add_argument("--rulings", help="组裁决 JSON（{\"rulings\": [{\"char\", \"reading\", \"action\", \"substitute\"?}]}），启动时写入学习层组记录并本轮生效")
+    p_conv.add_argument("--ssml", help="SSML 成品 TXT 输出路径（同行结构，仅 pin 处包 phoneme 标签；有未决问题时不出）")
+    p_conv.add_argument("--ssml-hints", help="SSML 钉音清单 JSON 输出路径（有未决问题时不出）")
     p_conv.add_argument("--db", help="直接指定 zhengyin.db 路径")
     p_conv.set_defaults(func=cmd_convert)
 

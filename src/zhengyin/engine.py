@@ -56,6 +56,8 @@ class Result:
     changes: list = field(default_factory=list)
     questions: list = field(default_factory=list)
     sentence_pinyin: list = field(default_factory=list)  # [(sentence, pinyin_line)]
+    ssml_hints: list = field(default_factory=list)
+    ssml_output: str = ""
 
 
 class Engine:
@@ -93,6 +95,47 @@ class Engine:
 
         phrase_reading = self._phrase_match(han_chars, han_canon, han_canon_str)
         hetero_reading = self._hetero_match(han_chars, han_canon, han_canon_str)
+
+        # Preliminary per-char targets (pinyin lock > phrase > heteronym),
+        # computed once: prescribed-phrase conflict checks and group-answer
+        # key resolution both need targets for *other* positions.
+        prelim_target: list[str | None] = [None] * n
+        prelim_raw: list[str | None] = [None] * n
+        prelim_src: list[str | None] = [None] * n
+        for _i in range(n):
+            _info = d.char_info(han_chars[_i])
+            _readings = list(_info["readings"]) if _info else []
+            if pinyin is not None:
+                _t, _stem, _tone = resolve_target(pinyin[_i], _readings)
+                if _t:
+                    _raw = _t
+                    if han_canon[_i] == "一" and _t in ("yi2", "yi4"):
+                        _t = "yi1"
+                    elif han_canon[_i] == "不" and _t == "bu2":
+                        _t = "bu4"
+                    prelim_target[_i], prelim_raw[_i], prelim_src[_i] = (
+                        _t, _raw, "pinyin")
+            if prelim_target[_i] is None and phrase_reading[_i]:
+                prelim_target[_i] = phrase_reading[_i]
+                prelim_raw[_i] = phrase_reading[_i]
+                prelim_src[_i] = "phrase"
+            if prelim_target[_i] is None and hetero_reading[_i]:
+                prelim_target[_i] = hetero_reading[_i]
+                prelim_raw[_i] = hetero_reading[_i]
+                prelim_src[_i] = "heteronym"
+
+        # Answers keyed by any occurrence id of a (char, target) group
+        # resolve that whole group: map group_key -> answer value.
+        group_answer_map: dict[str, str] = {}
+        for _k, _v in answers.items():
+            if isinstance(_k, str) and _k.startswith("q") and _k[1:].isdigit():
+                _idx = int(_k[1:])
+                if 0 <= _idx < n and prelim_target[_idx] is not None:
+                    group_answer_map[
+                        f"{han_chars[_idx]}|{prelim_target[_idx]}"] = _v
+
+        prescribed_phrase = self._prescribed_phrase_match(
+            han_chars, han_canon, han_canon_str, prelim_target)
         sent_han_canon: dict[int, str] = {}
         for j in range(n):
             sent_han_canon[sent_of[j]] = sent_han_canon.get(sent_of[j], "") + han_canon[j]
@@ -100,6 +143,7 @@ class Engine:
         out = list(text)
         changes: list[dict] = []
         questions: list[dict] = []
+        ssml_hints: list[dict] = []
         final_reading: list[str | None] = [None] * n
 
         for i in range(n):
@@ -128,23 +172,11 @@ class Engine:
                 continue
 
             # 1) target determination -----------------------------------------
-            target: str | None = None
-            raw: str | None = None
-            tsrc: str | None = None
+            # (precomputed: pinyin lock > phrase > heteronym)
+            target: str | None = prelim_target[i]
+            raw: str | None = prelim_raw[i]
+            tsrc: str | None = prelim_src[i]
             stem: str | None = None
-            if pinyin is not None:
-                target, stem, _tone = resolve_target(pinyin[i], readings)
-                if target:
-                    tsrc = "pinyin"
-                    raw = target
-                    if han_canon[i] == "一" and target in ("yi2", "yi4"):
-                        target = "yi1"
-                    elif han_canon[i] == "不" and target == "bu2":
-                        target = "bu4"
-            if target is None and phrase_reading[i]:
-                target, tsrc = phrase_reading[i], "phrase"
-            if target is None and hetero_reading[i]:
-                target, tsrc = hetero_reading[i], "heteronym"
 
             tj = d.tongjia_entries(ch)
             pd = d.podu_entries(ch)
@@ -199,14 +231,34 @@ class Engine:
                 cands.sort(key=_cand_key)
                 return cands[:10]
 
-            def ask(reason, entries_at, podu_at, tgt):
+            def ask(reason, entries_at, podu_at, tgt, group=False):
                 """Raise (or answer) a question for this character.
 
                 Returns True if the question stands, False if an answer
-                resolved it.
+                resolved it. With ``group=True`` (or an answer keyed by
+                any occurrence id of the same (char, target) group) the
+                answer adjudicates the whole group: a single character
+                (validated, then learned as a group ruling), ``"ssml"``
+                (pin every occurrence) or ``"keep"`` (keep every
+                occurrence, reading recorded, no change).
                 """
                 ans = answers.get(qid)
+                via_group_key = False
+                if ans is None and tgt is not None:
+                    gans = group_answer_map.get(f"{ch}|{tgt}")
+                    if gans is not None:
+                        ans = gans
+                        via_group_key = True
+                is_group = group or via_group_key
                 if ans is not None:
+                    if ans in ("ssml", "keep") and tgt is not None:
+                        self.learned.add_group(
+                            ch, tgt, "ssml" if ans == "ssml" else "keep")
+                        if ans == "ssml":
+                            apply_pin(tgt)
+                        else:
+                            final_reading[i] = tgt
+                        return False
                     ok, eff, fail = self._validate_answer(ans, tgt)
                     if ok:
                         sense = ""
@@ -214,7 +266,11 @@ class Engine:
                             if c["char"] == ans:
                                 sense = c.get("sense", "")
                                 break
-                        self.learned.add(ch, sentence, eff, ans, sense)
+                        if is_group and tgt is not None:
+                            self.learned.add_group(
+                                ch, tgt, "substitute", ans)
+                        else:
+                            self.learned.add(ch, sentence, eff, ans, sense)
                         out[han_pos[i]] = ans
                         final_reading[i] = eff
                         changes.append({
@@ -228,12 +284,20 @@ class Engine:
                 cands = candidates_for(entries_at, podu_at, tgt)
                 if not cands:
                     reason = f"{reason}（暂无通过校验的候选，可自答他字或保持原字）"
-                questions.append({
+                qrec = {
                     "id": qid, "char": ch, "index": han_pos[i],
                     "sentence": sentence, "prev": prev_s, "next": next_s,
                     "target_reading": tgt, "reason": reason,
                     "candidates": cands,
-                })
+                }
+                if group and tgt is not None:
+                    qrec["group"] = True
+                    qrec["group_key"] = f"{ch}|{tgt}"
+                    qrec["occurrences"] = [{
+                        "id": qid, "index": han_pos[i],
+                        "sentence": sentence, "prev": prev_s, "next": next_s,
+                    }]
+                questions.append(qrec)
                 return True
 
             def replace(to, reading, via, reading_via, sense="", ref="", note=""):
@@ -245,6 +309,36 @@ class Engine:
                 if note:
                     rec["note"] = note
                 changes.append(rec)
+
+            def apply_pin(tgt):
+                """SSML pin: keep the original char, record its reading."""
+                final_reading[i] = tgt
+                changes.append({
+                    "index": han_pos[i], "han_index": i, "char": ch,
+                    "to": ch, "reading": tgt, "via": "pin",
+                    "reading_via": tsrc or "",
+                    "ref": "ssml pin (group ruling)",
+                })
+                ssml_hints.append({
+                    "index": han_pos[i], "han_index": i, "char": ch,
+                    "reading": tgt, "sentence": sentence,
+                    "ssml": (f'<phoneme alphabet="py" ph="{tgt}">'
+                             f"{ch}</phoneme>"),
+                })
+
+            def apply_group_ruling(gr, tgt):
+                """Apply a learned group ruling for (char, target)."""
+                action = gr.get("action")
+                if action == "substitute" and gr.get("substitute"):
+                    replace(gr["substitute"], tgt, "learned", "group",
+                            "", "zhengyin learned layer (group ruling)")
+                elif action == "ssml":
+                    apply_pin(tgt)
+                elif action == "keep":
+                    final_reading[i] = raw if raw is not None else tgt
+                else:
+                    return False
+                return True
 
             def tongjia_try(tgt, allow_corroboration):
                 """Returns 'replaced' | 'asked' | 'kept' | None (no usable entry).
@@ -349,15 +443,32 @@ class Engine:
                 return "asked"
 
             # 2) resolution ----------------------------------------------------
+            # Priority: learned group ruling > prescribed > tongjia/podu
+            # > substitute index. (Learned context match ran above.)
+            if i in prescribed_phrase:
+                pp = prescribed_phrase[i]
+                eff = target if target is not None else pp["reading"]
+                gr = self.learned.match_group(ch, eff)
+                if gr and apply_group_ruling(gr, eff):
+                    continue
+                replace(pp["substitute"], pp["reading"], "prescribed",
+                        tsrc or "prescribed", "", pp.get("src_ref", ""))
+                continue
             if target is not None:
+                gr = self.learned.match_group(ch, target)
+                if gr and apply_group_ruling(gr, target):
+                    continue
+                pe = d.prescribed_for(ch, target)
+                if pe:
+                    replace(pe["substitute"], target, "prescribed",
+                            tsrc or "", "", pe.get("src_ref")
+                            or pe.get("src", ""))
+                    continue
                 r = tongjia_try(target, allow_corroboration=(tsrc == "pinyin"))
                 if r == "kept":
                     final_reading[i] = raw if raw is not None else target
                     continue
                 if r:
-                    continue
-                if info and target in (info.get("common") or []):
-                    final_reading[i] = raw if raw is not None else target
                     continue
                 if target != default:
                     pd_at = [e for e in pd if e["reading"] == target]
@@ -372,6 +483,21 @@ class Engine:
                                 done = True
                                 break
                     if done:
+                        continue
+                    # Common-reading boundary (v0.3.0): a *determined*
+                    # target that is a common reading but != default is
+                    # no longer exempt — the reading was locked, so
+                    # keeping the original would leave the correct
+                    # pronunciation to the TTS engine's guessing.
+                    # Unresolved cases go to a grouped question, never
+                    # straight to the substitute index.
+                    if info and target in (info.get("common") or []):
+                        ask(f"{ch} 读 {target}：该读音虽属常用读音，但"
+                            f"不等于默认读音 {default}，且读音已被锁定，"
+                            "不能再靠常用读音豁免保留原字；通假与已核破读"
+                            "均未能定夺，请裁决本字（可答替字、ssml 钉音"
+                            "或 keep 保留原字）",
+                            [], pd_at, target, group=True)
                         continue
                     if pd_at:
                         ask(f"破读条目建议 {ch} 读 {target}，但该条目未经核验，"
@@ -424,7 +550,9 @@ class Engine:
             final_reading[i] = default  # nothing suggests a non-default reading
 
         if questions:
-            return Result(status="questions", questions=questions, changes=changes)
+            return Result(status="questions",
+                          questions=self._merge_group_questions(questions),
+                          changes=changes, ssml_hints=ssml_hints)
 
         # sentence pinyin (converted text, per sentence)
         sent_py: list[tuple[str, str]] = []
@@ -433,8 +561,101 @@ class Engine:
             syl = [final_reading[i] or "—"
                    for i in range(n) if sent_of[i] == si]
             sent_py.append((conv, " ".join(syl)))
+        pin_by_pos = {h["index"]: h["ssml"] for h in ssml_hints}
+        ssml_output = "".join(
+            pin_by_pos.get(pos, out[pos]) for pos in range(len(out)))
         return Result(status="ok", output="".join(out), changes=changes,
-                      sentence_pinyin=sent_py)
+                      sentence_pinyin=sent_py, ssml_hints=ssml_hints,
+                      ssml_output=ssml_output)
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _merge_group_questions(questions: list[dict]) -> list[dict]:
+        """Merge questions sharing (char, target_reading) into one group.
+
+        The merged question keeps the first occurrence's id (so old
+        answers files stay valid), carries ``group``/``group_key``/
+        ``occurrences`` and notes the group size in its reason.
+        Single-occurrence questions not marked as group questions pass
+        through unchanged.
+        """
+        merged: list[dict] = []
+        by_key: dict[tuple, dict] = {}
+        for q in questions:
+            tgt = q.get("target_reading")
+            if tgt is None:
+                merged.append(q)
+                continue
+            key = (q["char"], tgt)
+            if key not in by_key:
+                by_key[key] = q
+                merged.append(q)
+                continue
+            first = by_key[key]
+            if not first.get("group"):
+                first["group"] = True
+                first["group_key"] = f"{key[0]}|{key[1]}"
+                first["occurrences"] = [{
+                    "id": first["id"], "index": first["index"],
+                    "sentence": first["sentence"], "prev": first["prev"],
+                    "next": first["next"],
+                }]
+            occ = q.get("occurrences") or [{
+                "id": q["id"], "index": q["index"],
+                "sentence": q["sentence"], "prev": q["prev"],
+                "next": q["next"],
+            }]
+            first["occurrences"].extend(occ)
+            seen = {(c["char"], c["reading"]) for c in first["candidates"]}
+            for c in q["candidates"]:
+                if (c["char"], c["reading"]) not in seen:
+                    first["candidates"].append(c)
+                    seen.add((c["char"], c["reading"]))
+        for q in merged:
+            if q.get("group"):
+                cnt = len(q.get("occurrences") or [])
+                if cnt and "本组共" not in q["reason"]:
+                    q["reason"] = f"{q['reason']}；本组共 {cnt} 处"
+        return merged
+
+    # ------------------------------------------------------------------
+    def _prescribed_phrase_match(self, han_chars, han_canon,
+                                 han_canon_str, prelim_target):
+        """Match prescribed phrases over the Han sequence.
+
+        A phrase applies only when no already-determined target (pinyin
+        lock / phrase table) conflicts with the entry's reading for
+        any of its characters.
+        """
+        d = self.d
+        n = len(han_chars)
+        result: dict[int, dict] = {}
+        covered = [False] * n
+        for i in range(n):
+            if covered[i]:
+                continue
+            for e in d.prescribed_phrases:
+                canon = e["_canon"]
+                L = len(canon)
+                if i + L > n or han_canon_str[i:i + L] != canon:
+                    continue
+                if any(covered[i + j] for j in range(L)):
+                    continue
+                readings = e["_readings"]
+                if any(prelim_target[i + j] is not None
+                       and prelim_target[i + j] != readings[j]
+                       for j in range(L)):
+                    continue
+                for j in range(L):
+                    result[i + j] = {
+                        "substitute": e["substitute"][j],
+                        "reading": readings[j],
+                        "src_ref": e.get("src_ref") or e.get("src", ""),
+                        "key": e["key"],
+                    }
+                    covered[i + j] = True
+                break
+        return result
 
     # ------------------------------------------------------------------
     def _example_matches(self, example: str, sent_han_canon: str) -> bool:
