@@ -38,6 +38,12 @@ class Dict:
                 d["default"] = d.get("default_reading") or (
                     d["readings"][0] if d["readings"] else None
                 )
+                try:
+                    _cr = d.get("common_readings")
+                    _common = json.loads(_cr) if _cr else []
+                    d["common"] = _common if isinstance(_common, list) else []
+                except (ValueError, TypeError):
+                    d["common"] = []
                 self.chars[d["char"]] = d
 
             self.tongjia: dict[str, list[dict]] = {}
@@ -147,6 +153,8 @@ class Dict:
             if not info:
                 continue
             if len(info["readings"]) != 1 or info["default"] != reading:
+                continue
+            if not info.get("in_8105") and info.get("freq_rank") is None:
                 continue
             rank = info.get("freq_rank")
             key = (0 if info.get("in_8105") else 1, 0 if rank is not None else 1,

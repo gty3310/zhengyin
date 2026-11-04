@@ -129,12 +129,18 @@ class Engine:
 
             # 1) target determination -----------------------------------------
             target: str | None = None
+            raw: str | None = None
             tsrc: str | None = None
             stem: str | None = None
             if pinyin is not None:
                 target, stem, _tone = resolve_target(pinyin[i], readings)
                 if target:
                     tsrc = "pinyin"
+                    raw = target
+                    if han_canon[i] == "一" and target in ("yi2", "yi4"):
+                        target = "yi1"
+                    elif han_canon[i] == "不" and target == "bu2":
+                        target = "bu4"
             if target is None and phrase_reading[i]:
                 target, tsrc = phrase_reading[i], "phrase"
             if target is None and hetero_reading[i]:
@@ -172,7 +178,26 @@ class Engine:
                     sub = d.best_substitute(tgt)
                     if sub:
                         offer(sub, tgt, "", note="同音替字")
-                return list(by_key.values())[:10]
+                cands = []
+                for rec in by_key.values():
+                    ci = d.char_info(rec["char"])
+                    if not ci:
+                        continue
+                    if rec["reading"] not in ci["readings"]:
+                        continue
+                    if ci["default"] != rec["reading"]:
+                        continue
+                    cands.append(rec)
+
+                def _cand_key(rec):
+                    ci = d.char_info(rec["char"]) or {}
+                    rank = ci.get("freq_rank")
+                    return (0 if ci.get("in_8105") else 1,
+                            0 if rank is not None else 1,
+                            rank if rank is not None else 1 << 30)
+
+                cands.sort(key=_cand_key)
+                return cands[:10]
 
             def ask(reason, entries_at, podu_at, tgt):
                 """Raise (or answer) a question for this character.
@@ -200,11 +225,14 @@ class Engine:
                         })
                         return False
                     reason = f"{reason}；上次答案「{ans}」未通过校验：{fail}"
+                cands = candidates_for(entries_at, podu_at, tgt)
+                if not cands:
+                    reason = f"{reason}（暂无通过校验的候选，可自答他字或保持原字）"
                 questions.append({
                     "id": qid, "char": ch, "index": han_pos[i],
                     "sentence": sentence, "prev": prev_s, "next": next_s,
                     "target_reading": tgt, "reason": reason,
-                    "candidates": candidates_for(entries_at, podu_at, tgt),
+                    "candidates": cands,
                 })
                 return True
 
@@ -219,7 +247,7 @@ class Engine:
                 changes.append(rec)
 
             def tongjia_try(tgt, allow_corroboration):
-                """Returns 'replaced' | 'asked' | None (no usable entry).
+                """Returns 'replaced' | 'asked' | 'kept' | None (no usable entry).
 
                 At a non-default reading, the special reading itself
                 signals a special usage, so tongjia entries at that
@@ -235,22 +263,61 @@ class Engine:
                         e for e in entries_at
                         if self._example_matches(e.get("example", ""),
                                                  sent_han_canon[si])]
-                if not entries_at:
-                    return None
-                benzis: dict[str, list[dict]] = {}
-                for e in entries_at:
-                    benzis.setdefault(e["benzi"], []).append(e)
-                if len(benzis) == 1:
-                    b, es = next(iter(benzis.items()))
-                    if d.benzi_valid(b, tgt):
-                        sense = "；".join(
-                            dict.fromkeys(e.get("sense", "") for e in es if e.get("sense")))
-                        ref = "；".join(
-                            dict.fromkeys(e.get("src_ref") or e.get("src", "") for e in es))
-                        replace(b, tgt, "tongjia", tsrc or "default", sense, ref)
-                        return "replaced"
-                    return None
+                    if not entries_at:
+                        return None
+                    # Default-reading floor: a benzi is auto-usable only
+                    # when the full tongjia table holds >=2 entries for
+                    # it at this reading (counted over all of tj, not
+                    # just the example-filtered subset).
+                    from collections import Counter
+                    full_counts = Counter(
+                        e["benzi"] for e in tj if e["reading"] == tgt)
+                    benzis_all: dict[str, list[dict]] = {}
+                    for e in entries_at:
+                        benzis_all.setdefault(e["benzi"], []).append(e)
+                    qualifying = {b for b in benzis_all
+                                  if full_counts.get(b, 0) >= 2}
+                    if not qualifying:
+                        pd_at0 = [e for e in pd if e["reading"] == tgt]
+                        ask(f"通假多义项竞争：{ch} 读 {tgt} 时可通 "
+                            + "、".join(f"{b}（{'/'.join(sorted({e.get('sense','') for e in es if e.get('sense')})) or '义项待补'}）"
+                                        for b, es in benzis_all.items())
+                            + "，默认读音下仅单条通假孤证，不敢自动落字",
+                            entries_at, pd_at0, tgt)
+                        return "asked"
+                    if len(qualifying) == 1:
+                        b = next(iter(qualifying))
+                        es = benzis_all[b]
+                        if d.benzi_valid(b, tgt):
+                            sense = "；".join(
+                                dict.fromkeys(e.get("sense", "") for e in es if e.get("sense")))
+                            ref = "；".join(
+                                dict.fromkeys(e.get("src_ref") or e.get("src", "") for e in es))
+                            replace(b, tgt, "tongjia", tsrc or "default", sense, ref)
+                            return "replaced"
+                        return None
+                    entries_at = [e for e in entries_at
+                                  if e["benzi"] in qualifying]
+                    benzis = {b: es for b, es in benzis_all.items()
+                              if b in qualifying}
+                else:
+                    if not entries_at:
+                        return None
+                    benzis: dict[str, list[dict]] = {}
+                    for e in entries_at:
+                        benzis.setdefault(e["benzi"], []).append(e)
+                    if len(benzis) == 1:
+                        b, es = next(iter(benzis.items()))
+                        if d.benzi_valid(b, tgt):
+                            sense = "；".join(
+                                dict.fromkeys(e.get("sense", "") for e in es if e.get("sense")))
+                            ref = "；".join(
+                                dict.fromkeys(e.get("src_ref") or e.get("src", "") for e in es))
+                            replace(b, tgt, "tongjia", tsrc or "default", sense, ref)
+                            return "replaced"
+                        return None
                 # several benzi compete
+                pick = None
                 if allow_corroboration:
                     pick = self._podu_corroboration(pd, tgt, han_canon_str, benzis)
                     if pick and d.benzi_valid(pick, tgt):
@@ -262,6 +329,17 @@ class Engine:
                         replace(pick, tgt, "tongjia", tsrc or "default", sense, ref,
                                 note="多本字竞争，由破读语境条目旁证消歧（读音已由用户拼音锁定）")
                         return "replaced"
+                # Evidence gate (non-default, user-pinyin only): when no
+                # competing entry's example matches this sentence and no
+                # corroboration hit, keep the original character instead
+                # of asking.
+                if tgt != default and tsrc == "pinyin":
+                    competed = [e for es in benzis.values() for e in es]
+                    if not pick and not any(
+                            self._example_matches(e.get("example", ""),
+                                                  sent_han_canon[si])
+                            for e in competed):
+                        return "kept"
                 pd_at = [e for e in pd if e["reading"] == tgt]
                 ask(f"通假多义项竞争：{ch} 读 {tgt} 时可通 "
                     + "、".join(f"{b}（{'/'.join(sorted({e.get('sense','') for e in es if e.get('sense')})) or '义项待补'}）"
@@ -273,7 +351,13 @@ class Engine:
             # 2) resolution ----------------------------------------------------
             if target is not None:
                 r = tongjia_try(target, allow_corroboration=(tsrc == "pinyin"))
+                if r == "kept":
+                    final_reading[i] = raw if raw is not None else target
+                    continue
                 if r:
+                    continue
+                if info and target in (info.get("common") or []):
+                    final_reading[i] = raw if raw is not None else target
                     continue
                 if target != default:
                     pd_at = [e for e in pd if e["reading"] == target]
@@ -302,13 +386,16 @@ class Engine:
                         "同音替字索引亦无安全候选", [], [], target)
                     continue
                 # target == default and no tongjia replacement: keep
-                final_reading[i] = target
+                final_reading[i] = raw if raw is not None else target
                 continue
 
             # no target determined yet
             if len(readings) == 1:
                 t = readings[0]
                 r = tongjia_try(t, allow_corroboration=False)
+                if r == "kept":
+                    final_reading[i] = t
+                    continue
                 if r:
                     continue
                 final_reading[i] = t
