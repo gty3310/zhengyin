@@ -16,8 +16,9 @@ import urllib.request
 from pathlib import Path
 
 from . import __version__
+from .audit import audit_text
 from .datalayer import Dict
-from .engine import Engine
+from .engine import Engine, is_han
 from .learnstore import LearnStore
 
 DICT_REPO = "gty3310/zhengyin-dict"
@@ -164,25 +165,51 @@ def cmd_convert(args) -> int:
         print(f"错误：{e}", file=sys.stderr)
         return 1
 
+    audit_path = Path(args.audit) if getattr(args, "audit", None) else (
+        Path(args.output).with_name("audit.json"))
+    if result.audit:
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        audit_path.write_text(json.dumps(result.audit, ensure_ascii=False,
+                                         indent=2), encoding="utf-8")
+    sem_path = None
+    if result.semantic_questions:
+        sem_path = Path(args.semantic_questions) if getattr(
+            args, "semantic_questions", None) else (
+            Path(args.output).with_name("semantic_questions.json"))
+        sem_path.parent.mkdir(parents=True, exist_ok=True)
+        sem_path.write_text(json.dumps(result.semantic_questions,
+                                       ensure_ascii=False, indent=2),
+                            encoding="utf-8")
+
     if result.status == "questions":
-        qpath = Path(args.questions or "questions.json")
+        qpath = Path(args.questions or "sound_questions.json")
         qpath.write_text(json.dumps(result.questions, ensure_ascii=False, indent=2),
                           encoding="utf-8")
         print(json.dumps({
             "status": "questions",
             "questions_file": str(qpath),
+            "sound_questions_file": str(qpath),
             "question_count": len(result.questions),
-            "hint": "请用户逐条作答（每条一个现代汉字；组问题可答替字、"
-                    "\"ssml\" 钉音或 \"keep\" 保留原字，一组一答），写入 "
-                    "answers.json（{\"q0\": \"字\", ...}）后以 --answers "
-                    "重跑本命令。",
+            "audit_file": str(audit_path) if result.audit else None,
+            "audit_counts": result.audit.get("counts") if result.audit else None,
+            "semantic_questions_file": str(sem_path) if sem_path else None,
+            "hint": "sound_questions 只含声音层残余问题（无目标音可定/未知字"
+                    "无锁定读音/映射冲突）：请执行 agent 逐条作答（替字或 "
+                    "\"ssml\"），写入 answers.json（{\"q0\": \"字\", ...}）"
+                    "后以 --answers 重跑；声音层没有 keep。语义待确认在 "
+                    "semantic_questions.json，不挡退出码。",
         }, ensure_ascii=False))
         return 2
 
     out_path = Path(args.output)
     out_path.write_text(result.output, encoding="utf-8")
     summary = {"status": "ok", "output": str(out_path),
-               "changes": len(result.changes)}
+               "changes": len(result.changes),
+               "audit_file": str(audit_path) if result.audit else None,
+               "audit_counts": result.audit.get("counts") if result.audit else None,
+               "semantic_questions_file": str(sem_path) if sem_path else None,
+               "note": "锁定版以 SSML 版为准：纯文本版里被钉音的字无锁"
+                       "（尤其音调型多音字），残余风险在 TTS 引擎，合成请用 SSML 版。"}
     if args.changes:
         cpath = Path(args.changes)
         cpath.write_text(json.dumps({
@@ -200,19 +227,63 @@ def cmd_convert(args) -> int:
             lines.append(py)
         ppath.write_text("\n".join(lines) + "\n", encoding="utf-8")
         summary["pinyin_file"] = str(ppath)
-    if getattr(args, "ssml", None):
-        spath = Path(args.ssml)
-        spath.write_text(result.ssml_output, encoding="utf-8")
-        summary["ssml_file"] = str(spath)
-        summary["ssml_hints"] = len(result.ssml_hints)
-    if getattr(args, "ssml_hints", None):
-        hpath = Path(args.ssml_hints)
-        hpath.write_text(json.dumps(result.ssml_hints,
-                                    ensure_ascii=False, indent=2),
-                         encoding="utf-8")
-        summary["ssml_hints_file"] = str(hpath)
+    # v0.4.0: SSML 版与钉音清单默认随成品一并产出（锁定版以 SSML 为准）。
+    spath = Path(args.ssml) if getattr(args, "ssml", None) else Path(
+        str(out_path) + ".ssml.txt")
+    spath.write_text(result.ssml_output, encoding="utf-8")
+    summary["ssml_file"] = str(spath)
+    summary["ssml_hints"] = len(result.ssml_hints)
+    hpath = Path(args.ssml_hints) if getattr(args, "ssml_hints", None) else (
+        out_path.with_name("ssml_hints.json"))
+    hpath.write_text(json.dumps(result.ssml_hints,
+                                ensure_ascii=False, indent=2),
+                     encoding="utf-8")
+    summary["ssml_hints_file"] = str(hpath)
     print(json.dumps(summary, ensure_ascii=False))
     return 0
+
+
+# ----------------------------------------------------------------------
+# audit (standalone re-check of an existing product)
+# ----------------------------------------------------------------------
+def cmd_audit(args) -> int:
+    d = load_dict(args.db)
+    text = Path(args.input).read_text(encoding="utf-8")
+    raw = Path(args.pinyin).read_text(encoding="utf-8")
+    syllables = raw.split()
+    pinned_han: set = set()
+    if getattr(args, "ssml_hints", None):
+        hints = json.loads(Path(args.ssml_hints).read_text(encoding="utf-8"))
+        han_index_of = {}
+        _k = 0
+        for _pos, _c in enumerate(text):
+            if is_han(_c):
+                han_index_of[_pos] = _k
+                _k += 1
+        for h in hints:
+            if "han_index" in h:
+                pinned_han.add(h["han_index"])
+            elif "index" in h and h["index"] in han_index_of:
+                pinned_han.add(han_index_of[h["index"]])
+    try:
+        audit = audit_text(d, text, syllables, pinned_han=pinned_han)
+    except ValueError as e:
+        print(f"错误：{e}", file=sys.stderr)
+        return 1
+    apath = Path(args.audit) if getattr(args, "audit", None) else Path("audit.json")
+    apath.write_text(json.dumps(audit, ensure_ascii=False, indent=2),
+                     encoding="utf-8")
+    unlocked = [det for det in audit["details"] if det["blocking"]]
+    print(json.dumps({
+        "status": "ok" if audit["passed"] else "blocked",
+        "audit_file": str(apath),
+        "counts": audit["counts"],
+        "unlocked_count": len(unlocked),
+        "hint": "" if audit["passed"] else
+                "终检未全过：未锁定明细见 audit.json 中 blocking 的逐字记录"
+                "（B＝多音字默认音未钉音，D＝不合格）。",
+    }, ensure_ascii=False))
+    return 0 if audit["passed"] else 2
 
 
 # ----------------------------------------------------------------------
@@ -291,13 +362,23 @@ def main(argv: list[str] | None = None) -> int:
                         help="另输出逐句拼音对照 TXT")
     p_conv.add_argument("--pinyin-out", help="拼音对照 TXT 路径")
     p_conv.add_argument("--changes", help="逐字转换清单 JSON 输出路径")
-    p_conv.add_argument("--questions", help="问题清单 JSON 输出路径（默认 ./questions.json）")
+    p_conv.add_argument("--questions", help="声音残余问题 JSON 输出路径（默认 ./sound_questions.json）")
+    p_conv.add_argument("--audit", help="终检报告 audit.json 输出路径（默认写到输出 TXT 同目录的 audit.json；停在残余问题环节时也写）")
+    p_conv.add_argument("--semantic-questions", help="语义待确认清单 JSON 输出路径（默认写到输出 TXT 同目录的 semantic_questions.json；无待确认组时不写）")
     p_conv.add_argument("--answers", help="用户答案 JSON（{\"q0\": \"字\"}；组问题可答替字、\"ssml\" 或 \"keep\"）")
     p_conv.add_argument("--rulings", help="组裁决 JSON（{\"rulings\": [{\"char\", \"reading\", \"action\", \"substitute\"?}]}），启动时写入学习层组记录并本轮生效")
-    p_conv.add_argument("--ssml", help="SSML 成品 TXT 输出路径（同行结构，仅 pin 处包 phoneme 标签；有未决问题时不出）")
-    p_conv.add_argument("--ssml-hints", help="SSML 钉音清单 JSON 输出路径（有未决问题时不出）")
+    p_conv.add_argument("--ssml", help="SSML 成品 TXT 输出路径（默认 <输出>.ssml.txt；同行结构，仅 pin 处包 phoneme 标签；有残余问题时不出）")
+    p_conv.add_argument("--ssml-hints", help="SSML 钉音清单 JSON 输出路径（默认输出同目录 ssml_hints.json；有残余问题时不出）")
     p_conv.add_argument("--db", help="直接指定 zhengyin.db 路径")
     p_conv.set_defaults(func=cmd_convert)
+
+    p_audit = sub.add_parser("audit", help="对既有成品单独终检复检（输出 audit.json；全字锁定退出码 0，有未锁定项 2）")
+    p_audit.add_argument("input", help="成品 TXT 路径")
+    p_audit.add_argument("--pinyin", required=True, help="拼音文件（每字一个音节，与成品汉字逐字对齐）")
+    p_audit.add_argument("--ssml-hints", help="可选：钉音清单 JSON（带 han_index 或 index），命中位置记 C 类")
+    p_audit.add_argument("--audit", help="audit.json 输出路径（默认 ./audit.json）")
+    p_audit.add_argument("--db", help="直接指定 zhengyin.db 路径")
+    p_audit.set_defaults(func=cmd_audit)
 
     p_lookup = sub.add_parser("lookup", help="查一个字的读音/通假/破读")
     p_lookup.add_argument("char")

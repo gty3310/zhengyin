@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zhengyin"
-version = "0.3.0"
+version = "0.4.0"
 description = "古文正音 CLI：为 AI Agent 准备的古文 TTS 定音预处理器（多音字/通假/破读的算法化校验与转换）"
 readme = "README.md"
 requires-python = ">=3.9"

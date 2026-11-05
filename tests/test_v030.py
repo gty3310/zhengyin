@@ -113,21 +113,26 @@ class V030(unittest.TestCase):
 
     # 1 ------------------------------------------------------------------
     def test_1_grouped_question_generation(self):
+        # supersede v0.4.0: grouped *sound* questions are abolished.
+        # 好 hao4 (locked, common, != default) is auto-pinned for both
+        # occurrences; nothing is asked.
         r = self.engine.convert("好好色", pinyin="hao4 hao4 se4".split())
-        self.assertEqual(r.status, "questions")
-        self.assertEqual(len(r.questions), 1, r.questions)
-        q = r.questions[0]
-        self.assertEqual(q["char"], "好")
-        self.assertTrue(q.get("group"), q)
-        self.assertEqual(q.get("group_key"), "好|hao4")
-        self.assertEqual(len(q["occurrences"]), 2, q)
+        self.assertEqual(r.status, "ok", r.questions)
+        self.assertEqual(r.questions, [])
+        self.assertEqual(r.output, "好好色")
+        self.assertEqual(len(r.ssml_hints), 2, r.ssml_hints)
+        self.assertEqual(r.audit["counts"]["C"], 2, r.audit)
+        self.assertEqual(r.audit["counts"]["A"], 1, r.audit)
+        self.assertTrue(r.audit["passed"], r.audit)
 
     # 2 ------------------------------------------------------------------
     def test_2_group_answer_ssml(self):
-        r1 = self.engine.convert("好好色", pinyin="hao4 hao4 se4".split())
-        qid = r1.questions[0]["id"]
-        r2 = self.engine.convert("好好色", pinyin="hao4 hao4 se4".split(),
-                                 answers={qid: "ssml"})
+        # supersede v0.4.0: there is no sound question to answer ssml
+        # to — but a learned *group ruling* of ssml (the user's own
+        # adjudication, e.g. via --rulings) still pins every occurrence
+        # and persists across runs.
+        self.learned.add_group("好", "hao4", "ssml")
+        r2 = self.engine.convert("好好色", pinyin="hao4 hao4 se4".split())
         self.assertEqual(r2.status, "ok", r2.questions)
         self.assertEqual(r2.output, "好好色")
         self.assertEqual(len(r2.ssml_hints), 2, r2.ssml_hints)
@@ -139,7 +144,6 @@ class V030(unittest.TestCase):
         pins = [c for c in r2.changes if c["via"] == "pin"]
         self.assertEqual(len(pins), 2, r2.changes)
         self.assertEqual(r2.ssml_output.count("<phoneme"), 2)
-        # rerun: group ruling is learned, no questions again
         r3 = self.engine.convert("好好色", pinyin="hao4 hao4 se4".split())
         self.assertEqual(r3.status, "ok", r3.questions)
         self.assertEqual(r3.output, "好好色")
@@ -147,12 +151,15 @@ class V030(unittest.TestCase):
 
     # 3 ------------------------------------------------------------------
     def test_3_group_answer_substitute(self):
+        # supersede v0.4.0: no sound question is generated for 惡 wu4 —
+        # the closure auto-pins it. A group *substitute ruling* from
+        # the user still wins over the auto-pin and is learned.
         r1 = self.engine.convert("惡惡", pinyin="wu4 wu4".split())
-        self.assertEqual(r1.status, "questions")
-        self.assertEqual(len(r1.questions), 1, r1.questions)
-        qid = r1.questions[0]["id"]
-        r2 = self.engine.convert("惡惡", pinyin="wu4 wu4".split(),
-                                 answers={qid: "悟"})
+        self.assertEqual(r1.status, "ok", r1.questions)
+        self.assertEqual(r1.output, "惡惡")
+        self.assertEqual(len(r1.ssml_hints), 2, r1.ssml_hints)
+        self.learned.add_group("惡", "wu4", "substitute", "悟")
+        r2 = self.engine.convert("惡惡", pinyin="wu4 wu4".split())
         self.assertEqual(r2.status, "ok", r2.questions)
         self.assertEqual(r2.output, "悟悟")
         groups = [e for e in self.learned.entries if e.get("scope") == "group"]
@@ -168,18 +175,19 @@ class V030(unittest.TestCase):
 
     # 4 ------------------------------------------------------------------
     def test_4_group_answer_keep_by_occurrence_id(self):
-        r1 = self.engine.convert("好好色", pinyin="hao4 hao4 se4".split())
-        occ_id = r1.questions[0]["occurrences"][1]["id"]
+        # supersede v0.4.0: the sound layer has no "keep" any more —
+        # a stray keep answer is meaningless (no question exists), the
+        # closure pins instead, and nothing is learned from it.
         r2 = self.engine.convert("好好色", pinyin="hao4 hao4 se4".split(),
-                                 answers={occ_id: "keep"})
+                                 answers={"q1": "keep"})
         self.assertEqual(r2.status, "ok", r2.questions)
         self.assertEqual(r2.output, "好好色")
-        self.assertFalse([c for c in r2.changes if c["char"] == "好"],
-                         r2.changes)
-        self.assertEqual(r2.ssml_hints, [])
+        self.assertEqual(len(r2.ssml_hints), 2, r2.ssml_hints)
+        self.assertEqual(self.learned.entries, [])
         r3 = self.engine.convert("好好色", pinyin="hao4 hao4 se4".split())
         self.assertEqual(r3.status, "ok", r3.questions)
         self.assertEqual(r3.output, "好好色")
+        self.assertEqual(len(r3.ssml_hints), 2, r3.ssml_hints)
 
     # 5 ------------------------------------------------------------------
     def test_5_prescribed_priority(self):

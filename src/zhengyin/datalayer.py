@@ -44,6 +44,44 @@ class Dict:
                     d["common"] = _common if isinstance(_common, list) else []
                 except (ValueError, TypeError):
                     d["common"] = []
+                # Modern-reading fields (dict v0.3.1 schema): tolerant —
+                # an older db without these columns derives them from
+                # the classical readings list, so behaviour degrades to
+                # the pre-v0.4 rule instead of crashing.
+                _mr = d.get("modern_readings")
+                _modern: list | None = None
+                if _mr:
+                    try:
+                        _parsed = json.loads(_mr) if isinstance(_mr, str) else _mr
+                        if isinstance(_parsed, list):
+                            _modern = [str(x) for x in _parsed]
+                    except (ValueError, TypeError):
+                        _modern = None
+                    if _modern is None and isinstance(_mr, str):
+                        _modern = [s for s in _mr.replace(",", " ").split() if s]
+                if _modern is None:
+                    _modern = list(d["readings"])
+                d["modern_readings"] = _modern
+                _ip = d.get("is_polyphonic")
+                if _ip is None:
+                    d["is_polyphonic"] = len(set(_modern)) > 1
+                elif isinstance(_ip, bool):
+                    d["is_polyphonic"] = _ip
+                elif isinstance(_ip, (int, float)):
+                    d["is_polyphonic"] = bool(_ip)
+                else:
+                    d["is_polyphonic"] = str(_ip).strip().lower() in (
+                        "1", "true", "yes", "y")
+                _ur = d.get("unique_reading")
+                if not _ur:
+                    if not d["is_polyphonic"] and len(_modern) == 1:
+                        _ur = _modern[0]
+                    elif not d["is_polyphonic"] and len(d["readings"]) == 1:
+                        _ur = d["readings"][0]
+                    else:
+                        _ur = None
+                d["unique_reading"] = _ur or None
+                d["modern_src"] = d.get("modern_src") or ""
                 self.chars[d["char"]] = d
 
             self.tongjia: dict[str, list[dict]] = {}
@@ -177,9 +215,13 @@ class Dict:
     def best_substitute(self, reading: str) -> str | None:
         """Safest same-sound replacement for ``reading``.
 
-        A candidate qualifies only if it is single-reading and its default
-        reading is exactly the target (so any default-reading TTS says it
-        right); ranked by commonness (normative-table membership, then
+        A candidate qualifies only if it is not polyphonic in modern
+        Chinese and its unique modern reading is exactly the target
+        (v0.4.0: judged on the v0.3.1 modern fields, not the classical
+        readings list). Note the substitute *index* is no longer an
+        automatic-landing source at all (v0.4.0 sound closure); this
+        helper now only feeds candidate lists for residual questions.
+        Ranked by commonness (normative-table membership, then
         frequency rank).
         """
         best: tuple | None = None
@@ -188,7 +230,9 @@ class Dict:
             info = self.chars.get(cand) or self.char_info(cand)
             if not info:
                 continue
-            if len(info["readings"]) != 1 or info["default"] != reading:
+            if info.get("is_polyphonic"):
+                continue
+            if info.get("unique_reading") != reading:
                 continue
             if not info.get("in_8105") and info.get("freq_rank") is None:
                 continue
@@ -202,3 +246,14 @@ class Dict:
     def benzi_valid(self, benzi: str, reading: str) -> bool:
         """True if ``benzi``'s default reading is exactly ``reading``."""
         return self.default_of(benzi) == reading
+
+    def strict_substitute_ok(self, ch: str, reading: str) -> bool:
+        """v0.4.0 landing validation for a semantic-equivalent substitute:
+        the glyph itself must land on audit class A — not polyphonic in
+        modern Chinese and its unique modern reading is the target."""
+        info = self.char_info(ch)
+        if not info:
+            return False
+        if info.get("is_polyphonic"):
+            return False
+        return info.get("unique_reading") == reading

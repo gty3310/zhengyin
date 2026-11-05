@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 
 from .datalayer import Dict
 from .learnstore import LearnStore
-from .pinyinutil import resolve_target
+from .pinyinutil import resolve_target, split_reading
 
 _HAN_RANGES = (
     (0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xF900, 0xFAFF),
@@ -58,6 +58,8 @@ class Result:
     sentence_pinyin: list = field(default_factory=list)  # [(sentence, pinyin_line)]
     ssml_hints: list = field(default_factory=list)
     ssml_output: str = ""
+    audit: dict = field(default_factory=dict)
+    semantic_questions: list = field(default_factory=list)
 
 
 class Engine:
@@ -144,6 +146,8 @@ class Engine:
         changes: list[dict] = []
         questions: list[dict] = []
         ssml_hints: list[dict] = []
+        semantic_raw: list[dict] = []
+        mapping_rejections: list[dict] = []
         final_reading: list[str | None] = [None] * n
 
         for i in range(n):
@@ -310,15 +314,18 @@ class Engine:
                     rec["note"] = note
                 changes.append(rec)
 
-            def apply_pin(tgt):
+            def apply_pin(tgt, note="", ref="ssml pin (group ruling)"):
                 """SSML pin: keep the original char, record its reading."""
                 final_reading[i] = tgt
-                changes.append({
+                rec = {
                     "index": han_pos[i], "han_index": i, "char": ch,
                     "to": ch, "reading": tgt, "via": "pin",
                     "reading_via": tsrc or "",
-                    "ref": "ssml pin (group ruling)",
-                })
+                    "ref": ref,
+                }
+                if note:
+                    rec["note"] = note
+                changes.append(rec)
                 ssml_hints.append({
                     "index": han_pos[i], "han_index": i, "char": ch,
                     "reading": tgt, "sentence": sentence,
@@ -339,6 +346,35 @@ class Engine:
                 else:
                     return False
                 return True
+
+            def record_semantic(kind, tgt, cand_list, rec_action,
+                                rec_char, rec_reason):
+                semantic_raw.append({
+                    "han_index": i, "char": ch, "target": tgt,
+                    "kind": kind, "candidates": cand_list,
+                    "recommendation": {"action": rec_action,
+                                       "char": rec_char,
+                                       "reason": rec_reason},
+                    "sentence": sentence, "index": han_pos[i],
+                })
+
+            def record_rejection(tgt, benzi, via):
+                mapping_rejections.append({
+                    "han_index": i, "char": ch, "reading": tgt,
+                    "substitute": benzi, "via": via,
+                    "reason": (f"替字「{benzi}」未过终检校验（须非多音字且"
+                               f"唯一读音＝{tgt}），已驳回、改钉音原字"),
+                    "sentence": sentence,
+                })
+
+            def benzi_candidates(benzis_map, tgt):
+                out_c = []
+                for b, es in benzis_map.items():
+                    sense = "/".join(sorted(
+                        {e.get("sense", "") for e in es if e.get("sense")}))
+                    out_c.append({"char": b, "reading": tgt,
+                                  "sense": sense or "义项待补"})
+                return out_c
 
             def tongjia_try(tgt, allow_corroboration):
                 """Returns 'replaced' | 'asked' | 'kept' | None (no usable entry).
@@ -372,23 +408,37 @@ class Engine:
                     qualifying = {b for b in benzis_all
                                   if full_counts.get(b, 0) >= 2}
                     if not qualifying:
-                        pd_at0 = [e for e in pd if e["reading"] == tgt]
-                        ask(f"通假多义项竞争：{ch} 读 {tgt} 时可通 "
-                            + "、".join(f"{b}（{'/'.join(sorted({e.get('sense','') for e in es if e.get('sense')})) or '义项待补'}）"
-                                        for b, es in benzis_all.items())
-                            + "，默认读音下仅单条通假孤证，不敢自动落字",
-                            entries_at, pd_at0, tgt)
-                        return "asked"
+                        # v0.4.0: sound is unaffected (target == default);
+                        # whether to swap in the benzi is a *semantic*
+                        # judgement on isolated evidence — it goes to
+                        # semantic_questions, never to a sound question.
+                        _bc = benzi_candidates(benzis_all, tgt)
+                        record_semantic(
+                            "isolated_evidence", tgt, _bc, "substitute",
+                            _bc[0]["char"] if _bc else None,
+                            "例句与本文语境吻合，但该本字在全表仅单条通假"
+                            "孤证：声音层保留原字，义项是否换本字请用户确认")
+                        return "kept"
                     if len(qualifying) == 1:
                         b = next(iter(qualifying))
                         es = benzis_all[b]
-                        if d.benzi_valid(b, tgt):
+                        if d.strict_substitute_ok(b, tgt):
                             sense = "；".join(
                                 dict.fromkeys(e.get("sense", "") for e in es if e.get("sense")))
                             ref = "；".join(
                                 dict.fromkeys(e.get("src_ref") or e.get("src", "") for e in es))
                             replace(b, tgt, "tongjia", tsrc or "default", sense, ref)
                             return "replaced"
+                        if d.benzi_valid(b, tgt):
+                            record_rejection(tgt, b, "tongjia")
+                            record_semantic(
+                                "substitute_rejected", tgt,
+                                benzi_candidates(benzis_all, tgt),
+                                "keep_pinned", None,
+                                f"通假本字「{b}」语义等值，但其本身为多音字、"
+                                "未过声音校验，声音层不自动落字；是否换字请"
+                                "用户确认语义")
+                            return "kept"
                         return None
                     entries_at = [e for e in entries_at
                                   if e["benzi"] in qualifying]
@@ -402,19 +452,33 @@ class Engine:
                         benzis.setdefault(e["benzi"], []).append(e)
                     if len(benzis) == 1:
                         b, es = next(iter(benzis.items()))
-                        if d.benzi_valid(b, tgt):
+                        if d.strict_substitute_ok(b, tgt):
                             sense = "；".join(
                                 dict.fromkeys(e.get("sense", "") for e in es if e.get("sense")))
                             ref = "；".join(
                                 dict.fromkeys(e.get("src_ref") or e.get("src", "") for e in es))
                             replace(b, tgt, "tongjia", tsrc or "default", sense, ref)
                             return "replaced"
+                        if d.benzi_valid(b, tgt):
+                            record_rejection(tgt, b, "tongjia")
+                            apply_pin(tgt, note="通假替字未过终检校验，驳回改钉音",
+                                      ref="ssml pin (auto, v0.4.0 sound closure)")
+                            return "pinned"
                         return None
                 # several benzi compete
                 pick = None
                 if allow_corroboration:
                     pick = self._podu_corroboration(pd, tgt, han_canon_str, benzis)
-                    if pick and d.benzi_valid(pick, tgt):
+                    if pick and d.benzi_valid(pick, tgt) \
+                            and not d.strict_substitute_ok(pick, tgt):
+                        record_rejection(tgt, pick, "tongjia")
+                        record_semantic(
+                            "substitute_rejected", tgt,
+                            benzi_candidates(benzis, tgt), "keep_pinned", None,
+                            f"破读旁证荐本字「{pick}」，但其本身为多音字、"
+                            "未过声音校验；是否换字请用户确认语义")
+                        pick = None
+                    if pick and d.strict_substitute_ok(pick, tgt):
                         es = benzis[pick]
                         sense = "；".join(
                             dict.fromkeys(e.get("sense", "") for e in es if e.get("sense")))
@@ -433,14 +497,26 @@ class Engine:
                             self._example_matches(e.get("example", ""),
                                                   sent_han_canon[si])
                             for e in competed):
+                        record_semantic(
+                            "competition", tgt,
+                            benzi_candidates(benzis, tgt), "keep_pinned",
+                            None,
+                            "多本字竞争且无例句语境吻合、无旁证命中：保字"
+                            "保义优先，声音层钉音解决；义项请用户确认")
                         return "kept"
-                pd_at = [e for e in pd if e["reading"] == tgt]
-                ask(f"通假多义项竞争：{ch} 读 {tgt} 时可通 "
-                    + "、".join(f"{b}（{'/'.join(sorted({e.get('sense','') for e in es if e.get('sense')})) or '义项待补'}）"
-                                for b, es in benzis.items())
-                    + "，上下文不足以定夺",
-                    entries_at, pd_at, tgt)
-                return "asked"
+                # v0.4.0: competing benzi is a semantic judgement; the
+                # sound layer closes by pinning (non-default) or by the
+                # final audit (default). It never becomes a sound question.
+                record_semantic(
+                    "competition", tgt, benzi_candidates(benzis, tgt),
+                    "keep_pinned", None,
+                    "多义项通假竞争、上下文不足以定夺：保字保义优先，"
+                    "声音层钉音解决；义项请用户确认")
+                if tgt != default:
+                    apply_pin(tgt, note="通假多义项竞争，声音层自动钉音",
+                              ref="ssml pin (auto, v0.4.0 sound closure)")
+                    return "pinned"
+                return "kept"
 
             # 2) resolution ----------------------------------------------------
             # Priority: learned group ruling > prescribed > tongjia/podu
@@ -476,7 +552,11 @@ class Engine:
                     for e in pd_at:
                         if e.get("verified") in ("human_checked", "user_confirmed"):
                             b = parse_benzi(e.get("sense", ""))
-                            if b and d.benzi_valid(b, target):
+                            if b and d.benzi_valid(b, target) \
+                                    and not d.strict_substitute_ok(b, target):
+                                record_rejection(target, b, "podu")
+                                continue
+                            if b and d.strict_substitute_ok(b, target):
                                 replace(b, target, "podu", tsrc or "",
                                         gloss_of(e.get("sense", "")),
                                         e.get("src", ""))
@@ -484,38 +564,34 @@ class Engine:
                                 break
                     if done:
                         continue
-                    # Common-reading boundary (v0.3.0): a *determined*
-                    # target that is a common reading but != default is
-                    # no longer exempt — the reading was locked, so
-                    # keeping the original would leave the correct
-                    # pronunciation to the TTS engine's guessing.
-                    # Unresolved cases go to a grouped question, never
-                    # straight to the substitute index.
+                    # v0.4.0 sound closure: the target reading is locked
+                    # but no semantic-equivalent mapping landed. Sound
+                    # problems are never put to the user and the pure
+                    # homophone substitute index no longer lands
+                    # automatically — the position is pinned by SSML.
                     if info and target in (info.get("common") or []):
-                        ask(f"{ch} 读 {target}：该读音虽属常用读音，但"
-                            f"不等于默认读音 {default}，且读音已被锁定，"
-                            "不能再靠常用读音豁免保留原字；通假与已核破读"
-                            "均未能定夺，请裁决本字（可答替字、ssml 钉音"
-                            "或 keep 保留原字）",
-                            [], pd_at, target, group=True)
-                        continue
-                    if pd_at:
-                        ask(f"破读条目建议 {ch} 读 {target}，但该条目未经核验，"
-                            "不敢直接落字", [], pd_at, target)
-                        continue
-                    sub = d.best_substitute(target)
-                    if sub:
-                        replace(sub, target, "substitute", tsrc or "",
-                                "", "substitutes index (single-reading, default=target)")
-                        continue
-                    ask(f"{ch} 应读 {target}，但字典中无本字映射、"
-                        "同音替字索引亦无安全候选", [], [], target)
+                        _note = ("常用读音≠默认读音且已被锁定，自动钉音"
+                                 "（v0.4.0 声音闭环）")
+                    elif pd_at:
+                        _note = ("破读条目未核、读音已锁定，自动钉音"
+                                 "（v0.4.0 声音闭环）")
+                    else:
+                        _note = ("无语义等值映射，自动钉音；纯同音替字索引"
+                                 "不再自动落字（v0.4.0 声音闭环）")
+                    apply_pin(target, note=_note,
+                              ref="ssml pin (auto, v0.4.0 sound closure)")
                     continue
                 # target == default and no tongjia replacement: keep
                 final_reading[i] = raw if raw is not None else target
                 continue
 
             # no target determined yet
+            if info is None:
+                # Unknown glyph with no locked reading: a genuine
+                # residual — the executing agent must answer it.
+                ask(f"{ch} 不在字典字表（未知字），且无拼音锁定读音，"
+                    "无法定音", [], [], None)
+                continue
             if len(readings) == 1:
                 t = readings[0]
                 r = tongjia_try(t, allow_corroboration=False)
@@ -549,10 +625,206 @@ class Engine:
                 continue
             final_reading[i] = default  # nothing suggests a non-default reading
 
+        # ---- v0.4.0 final audit （终检） + sound closure -----------------
+        # Detect B/D on the provisional product, then close every
+        # closable position here (auto-pin; a semantic-equivalent
+        # substitute only if it passes the strict A validation) and
+        # re-audit. Positions already covered by a residual sound
+        # question (target undetermined / unknown glyph) are left to
+        # the question loop. Exit 0 <=> final audit fully passed.
+        from .audit import build_audit as _build_audit
+
+        _covered_han: set = set()
+        _q_target: dict = {}
+        for _q in questions:
+            _qid = _q.get("id", "")
+            if _qid.startswith("q") and _qid[1:].isdigit():
+                _covered_han.add(int(_qid[1:]))
+                _q_target[int(_qid[1:])] = _q.get("target_reading")
+
+        def _positions():
+            pin_han = {h["han_index"] for h in ssml_hints}
+            ch_by_han = {}
+            for c in changes:
+                ch_by_han[c["han_index"]] = c
+            pos = []
+            for i in range(n):
+                tgt = final_reading[i]
+                if tgt is None:
+                    tgt = _q_target.get(i)
+                rec = ch_by_han.get(i)
+                si = sent_of[i]
+                pos.append({
+                    "han_index": i, "index": han_pos[i], "char": han_chars[i],
+                    "out_char": out[han_pos[i]], "target": tgt,
+                    "pinned": i in pin_han,
+                    "via": rec.get("via", "") if rec else "",
+                    "sentence": sent_texts[si],
+                    "prev": sent_texts[si - 1] if si > 0 else "",
+                    "next": sent_texts[si + 1] if si + 1 < len(sent_texts) else "",
+                })
+            return pos
+
+        _detected = _build_audit(d, _positions())
+        _detected_by_han = {det["han_index"]: det for det in _detected["details"]}
+        resolutions: list[dict] = []
+
+        def _audit_pin(det, rule, note):
+            i = det["han_index"]
+            oc = det["out_char"]
+            if not any(h["han_index"] == i for h in ssml_hints):
+                ssml_hints.append({
+                    "index": han_pos[i], "han_index": i, "char": oc,
+                    "reading": det["target_norm"], "sentence": det["sentence"],
+                    "ssml": (f'<phoneme alphabet="py" '
+                             f'ph="{det["target_norm"]}">{oc}</phoneme>'),
+                })
+                changes.append({
+                    "index": han_pos[i], "han_index": i,
+                    "char": han_chars[i], "to": oc,
+                    "reading": det["target_norm"], "via": "pin",
+                    "reading_via": "audit-auto",
+                    "ref": "ssml pin (audit closure, v0.4.0)",
+                    "note": note,
+                })
+            resolutions.append({
+                "han_index": i, "char": det["char"], "out_char": oc,
+                "target": det["target_norm"], "detected": det["category"],
+                "rule": rule, "sentence": det["sentence"],
+            })
+
+        for det in _detected["details"]:
+            if not det["blocking"]:
+                continue
+            i = det["han_index"]
+            if i in _covered_han or det["target_norm"] is None:
+                continue
+            tgt = det["target_norm"]
+            orig = han_chars[i]
+            oc = det["out_char"]
+            if oc != orig:
+                # A substitute already landed (learned / prescribed).
+                _oinfo = d.char_info(oc)
+                if det["category"] == "B":
+                    _audit_pin(det, "rule1_default_pin",
+                               "已落替字为多音字、目标音＝其默认音，钉音锁定")
+                else:
+                    # The landed substitute fails the audit itself:
+                    # reject it, revert to the original glyph, pin that.
+                    mapping_rejections.append({
+                        "han_index": i, "char": orig, "reading": tgt,
+                        "substitute": oc,
+                        "via": det.get("via", ""),
+                        "reason": (f"已落替字「{oc}」未过终检"
+                                   f"（{det['basis']}），已驳回、改钉音原字"),
+                        "sentence": det["sentence"],
+                    })
+                    out[han_pos[i]] = orig
+                    det2 = dict(det)
+                    det2["out_char"] = orig
+                    _audit_pin(det2, "rule2_mapping_rejected_pin",
+                               f"替字{oc}未过终检，驳回改钉音原字")
+                continue
+            # Original glyph kept: try a semantic-equivalent mapping
+            # (tongjia single benzi / prescribed) under strict validation.
+            # Only a prescribed mapping may land at the audit stage:
+            # tongjia benzi choices are semantic-gated (competition /
+            # isolated evidence) and are adjudicated in the engine's
+            # tongjia pass under its evidence rules, never here.
+            _cand = None
+            _pe = d.prescribed_for(orig, tgt)
+            if _pe:
+                _cand = _pe["substitute"]
+            _landed = False
+            if _cand is not None:
+                if d.strict_substitute_ok(_cand, tgt):
+                    out[han_pos[i]] = _cand
+                    final_reading[i] = tgt
+                    changes.append({
+                        "index": han_pos[i], "han_index": i, "char": orig,
+                        "to": _cand, "reading": tgt, "via": "tongjia",
+                        "reading_via": "audit",
+                        "ref": "semantic-equivalent mapping (audit closure)",
+                    })
+                    resolutions.append({
+                        "han_index": i, "char": orig, "out_char": _cand,
+                        "target": tgt, "detected": det["category"],
+                        "rule": "rule2_semantic_substitute",
+                        "sentence": det["sentence"],
+                    })
+                    _landed = True
+                elif d.benzi_valid(_cand, tgt):
+                    mapping_rejections.append({
+                        "han_index": i, "char": orig, "reading": tgt,
+                        "substitute": _cand, "via": "mapping",
+                        "reason": (f"语义等值替字「{_cand}」未过终检校验"
+                                   "（须非多音字且唯一读音＝目标音），"
+                                   "已驳回、改钉音原字"),
+                        "sentence": det["sentence"],
+                    })
+            if _landed:
+                continue
+            _oinfo = d.char_info(orig)
+            if _oinfo and not _oinfo.get("is_polyphonic") \
+                    and _oinfo.get("unique_reading"):
+                _odef = _oinfo["unique_reading"]
+            else:
+                _odef = _oinfo["default"] if _oinfo else None
+            _tstem = split_reading(tgt)[0]
+            _dstem = split_reading(_odef)[0] if _odef else None
+            if _tstem is not None and _tstem == _dstem:
+                if tgt != _odef:
+                    _rule = "rule1_tone_only_pin"
+                    _note = "与默认读音只差声调，自动钉调"
+                else:
+                    _rule = "rule1_default_pin"
+                    _note = "多音字目标音＝默认音，自动钉音锁定"
+            elif any(r["han_index"] == i for r in mapping_rejections):
+                _rule = "rule2_mapping_rejected_pin"
+                _note = "语义替字未过校验，驳回改钉音原字"
+            else:
+                _rule = "rule2_syllable_pin"
+                _note = "音节不同且无语义等值映射，自动钉全读音"
+            _audit_pin(det, _rule, _note)
+
+        audit = _build_audit(d, _positions())
+        audit["detected_counts"] = _detected["counts"]
+        for det in audit["details"]:
+            _dd = _detected_by_han.get(det["han_index"])
+            det["detected_category"] = _dd["category"] if _dd else det["category"]
+        audit["resolutions"] = resolutions
+        audit["mapping_rejections"] = mapping_rejections
+
+        # Group semantic questions by (char, target, kind).
+        from collections import OrderedDict as _OD3
+        _sgroups: dict = _OD3()
+        for _sr in semantic_raw:
+            _sgroups.setdefault(
+                (_sr["char"], _sr["target"], _sr["kind"]), []).append(_sr)
+        semantic_questions: list[dict] = []
+        for _k, (_key, _occs) in enumerate(_sgroups.items()):
+            _ch, _tgt, _kind = _key
+            _first = _occs[0]
+            semantic_questions.append({
+                "id": f"s{_k + 1}",
+                "char": _ch,
+                "target_reading": _tgt,
+                "kind": _kind,
+                "group": True,
+                "group_key": f"{_ch}|{_tgt}|{_kind}",
+                "candidates": _first["candidates"],
+                "recommendation": _first["recommendation"],
+                "reason": _first["recommendation"].get("reason", ""),
+                "occurrences": [{
+                    "han_index": o["han_index"], "index": o["index"],
+                    "sentence": o["sentence"]} for o in _occs],
+            })
+
         if questions:
             return Result(status="questions",
                           questions=self._merge_group_questions(questions),
-                          changes=changes, ssml_hints=ssml_hints)
+                          changes=changes, ssml_hints=ssml_hints,
+                          audit=audit, semantic_questions=semantic_questions)
 
         # sentence pinyin (converted text, per sentence)
         sent_py: list[tuple[str, str]] = []
@@ -566,7 +838,8 @@ class Engine:
             pin_by_pos.get(pos, out[pos]) for pos in range(len(out)))
         return Result(status="ok", output="".join(out), changes=changes,
                       sentence_pinyin=sent_py, ssml_hints=ssml_hints,
-                      ssml_output=ssml_output)
+                      ssml_output=ssml_output, audit=audit,
+                      semantic_questions=semantic_questions)
 
     # ------------------------------------------------------------------
     @staticmethod
