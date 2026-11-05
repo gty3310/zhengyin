@@ -26,11 +26,16 @@ DB="$HOME/.zhengyin/data/zhengyin.db"
 echo; echo "===== CASE 5b: lookup 說 ====="
 $ZY lookup 說 --db "$DB"
 
-echo; echo "===== CASE 1a: 论语 + 拼音 (說=yue4) -> tongjia 悦 ====="
+echo; echo "===== CASE 1a: 论语 + 拼音 (說=yue4) -> v0.4.1 proposal 悦 -> review approve -> lands ====="
 printf '學而時習之，不亦說乎' > lunyu.txt
 printf 'xue2 er2 shi2 xi2 zhi1 bu4 yi4 yue4 hu1' > lunyu.pinyin.txt
 $ZY convert lunyu.txt -o lunyu.out.txt --pinyin lunyu.pinyin.txt --changes lunyu.changes.json --with-pinyin --db "$DB"
-echo "exit=$?"
+echo "exit=$? (expect 2 in v0.4.1: tongjia 悦 is a proposal until context review)"
+echo "--- proposals:"; cat substitute_proposals.json
+PID=$(python3 -c "import json;print([p['id'] for p in json.load(open('substitute_proposals.json')) if p['char']=='說'][0])")
+python3 -c "import json;json.dump({'reviews':[{'id':'$PID','decision':'approve','sense_fit':'不亦說乎之說为喜悦义，悦合此句语境'}]}, open('review1a.json','w'), ensure_ascii=False)"
+$ZY convert lunyu.txt -o lunyu.out.txt --pinyin lunyu.pinyin.txt --changes lunyu.changes.json --with-pinyin --substitute-review review1a.json --db "$DB"
+echo "exit=$? (expect 0 after approval)"
 echo "--- output:"; cat lunyu.out.txt; echo
 echo "--- pinyin file:"; cat lunyu.out.txt.pinyin.txt
 echo "--- changes:"; cat lunyu.changes.json
@@ -55,7 +60,11 @@ echo "run1 exit=$? (expect 2)"; cat q3.json
 QID=$(python3 -c "import json;print(json.load(open('q3.json'))[0]['id'])")
 python3 -c "import json;json.dump({'$QID':'供'}, open('a3.json','w'), ensure_ascii=False)"
 $ZY convert gong.txt -o gong.out.txt --answers a3.json --db "$DB"
-echo "run2 exit=$? (expect 0)"; echo "output: $(cat gong.out.txt)"
+echo "run2 exit=$? (expect 2 in v0.4.1: the answer 供 is a proposal until context review)"; cat substitute_proposals.json
+PID=$(python3 -c "import json;print(json.load(open('substitute_proposals.json'))[0]['id'])")
+python3 -c "import json;json.dump({'reviews':[{'id':'$PID','decision':'approve','sense_fit':'共在此语境通供，义合'}]}, open('review3.json','w'), ensure_ascii=False)"
+$ZY convert gong.txt -o gong.out.txt --answers a3.json --substitute-review review3.json --db "$DB"
+echo "run2b exit=$? (expect 0 after approval)"; echo "output: $(cat gong.out.txt)"
 echo "--- learned.jsonl:"; cat "$HOME/.zhengyin/learned.jsonl"
 $ZY convert gong.txt -o gong.out.txt --db "$DB"
 echo "run3 exit=$? (expect 0, no questions)"; echo "output: $(cat gong.out.txt)"

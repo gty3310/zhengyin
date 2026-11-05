@@ -3,6 +3,48 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.4.1] - 2026-11-05
+
+### 新增
+
+- 替字语境审闸门（substitute context review）：一切字典来源替字
+  （通假本字、已核破读替字、破读旁证消歧的胜出本字）与 `--answers`
+  给出的替字答案，落字前必过两道闸——(a) 硬验（字典候选过
+  `strict_substitute_ok`：非多音字且唯一现代读音＝目标音；答案过
+  既有答案校验：默认读音＝目标音），不过者记入驳回轨迹、永不进
+  提案；(b) 语境审：过硬验的替字先写成提案
+  `substitute_proposals.json`（默认输出同目录；每条含 id、index、
+  han_index、char、reading、candidate、via、sense、ref、sentence、
+  prev、next），convert 以退出码 2 停下、不出成品，与声音残余
+  问题同待遇。
+- `--substitute-review FILE`：读语境审结果
+  `{"reviews": [{"id", "decision": "approve"|"reject",
+  "sense_fit": "一句理由"}]}`（approve 必须带非空 sense_fit，
+  缺失或格式不合法退出码 1）。带审结果重跑：approve 的替字复验
+  硬闸后落字，转换清单该条带 `sense_fit` 留痕；reject 的改 SSML
+  钉音保原字。审轨迹写 `audit.json` 新增 `substitute_reviews` 段
+  （通过/驳回计数与逐条记录，驳回带 `kind="context_review"` 与
+  理由）。`--substitute-proposals FILE` 可改提案文件路径。
+
+### 变更
+
+- 通假降为提案：废除 tongjia「≥2 条互证即自动落字」与单条目、
+  旁证消歧的全部自动落字路径——条目存在＋互证＋硬验过，只够格
+  生成提案，义项与句子语境是否对位由执行 Agent 在语境审中裁断。
+  起因：《中庸》实跑中 地 dì→第 ×16（条目义项是副词「但、只」，
+  文中全是名词「天地」）、強 qiǎng→襁 ×12 等音对义错的自动落字。
+- 免审直落只剩两类：学习层已有用户确认的（字＋读音＋义项）条目
+  （含 `--rulings` 灌入的组裁决）、prescribed 指定替字。其余一律
+  走提案；无合格替字或语境审不过，默认回退 SSML 钉音保原字。
+  退出码 0 的终态定义不变（零未锁定字，A＋C）。
+- 回归：既有 34 项中 3 项按新规矩 supersede 改写（acceptance
+  case1a 两项：說→悦 改为提案＋批准后落字；case3：答案替字改为
+  提案＋批准后才入学习层），逐项在用例内注明；新增 v0.4.1 用例
+  7 项（地→第 提案驳回钉音留痕、知→智 提案批准落字带 sense_fit、
+  強→襁 驳回回退钉音、学习层已确认条目免审直落、多音替字硬验
+  不过永不进提案、approve 缺 sense_fit 不生效、CLI 提案退出码 2
+  与审回路全程），共 41 项全过。
+
 ## [0.4.0] - 2026-11-05
 
 ### 新增
@@ -144,6 +186,8 @@
 - 提问触发收紧：无任何定音依据时，仅当有破读条目、非默认读音下存在
   多本字竞争、或条目例句与语境吻合等「特殊用法证据」才提问，不因
   字典里偶有一条冷僻通假就打断转换。
+
+[0.4.1]: https://github.com/gty3310/zhengyin/releases/tag/v0.4.1
 
 [0.4.0]: https://github.com/gty3310/zhengyin/releases/tag/v0.4.0
 

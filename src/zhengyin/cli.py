@@ -141,6 +141,36 @@ def load_rulings(path, learned: LearnStore, engine: Engine) -> None:
                           src="user-ruling")
 
 
+def load_substitute_review(path) -> dict:
+    """Load --substitute-review JSON into the engine's review map.
+
+    Format: {"reviews": [{"id", "decision": "approve"|"reject",
+    "sense_fit": "一句理由"}]}. An approval must carry a non-empty
+    sense_fit (the reviewer states why the substitute fits this
+    sentence); anything malformed raises ValueError (caller exits 1).
+    """
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    reviews = data.get("reviews") if isinstance(data, dict) else data
+    if not isinstance(reviews, list):
+        raise ValueError("substitute-review 文件格式应为 {\"reviews\": [...]}")
+    out: dict = {}
+    for r in reviews:
+        rid = r.get("id", "")
+        decision = r.get("decision", "")
+        if not rid:
+            raise ValueError(f"substitute-review 条目缺 id：{r}")
+        if decision not in ("approve", "reject"):
+            raise ValueError(
+                f"substitute-review 条目 decision 须为 approve/reject：{r}")
+        sense_fit = (r.get("sense_fit") or "").strip()
+        if decision == "approve" and not sense_fit:
+            raise ValueError(
+                f"substitute-review 批准条目须带非空 sense_fit（审者须"
+                f"写明替字为何合此句语境）：{r}")
+        out[rid] = {"decision": decision, "sense_fit": sense_fit}
+    return out
+
+
 def cmd_convert(args) -> int:
     d = load_dict(args.db)
     text = Path(args.input).read_text(encoding="utf-8")
@@ -151,6 +181,13 @@ def cmd_convert(args) -> int:
     answers = None
     if args.answers:
         answers = json.loads(Path(args.answers).read_text(encoding="utf-8"))
+    substitute_review = None
+    if getattr(args, "substitute_review", None):
+        try:
+            substitute_review = load_substitute_review(args.substitute_review)
+        except (ValueError, OSError, json.JSONDecodeError) as e:
+            print(f"错误：{e}", file=sys.stderr)
+            return 1
     learned = LearnStore()
     engine = Engine(d, learned)
     if getattr(args, "rulings", None):
@@ -160,7 +197,8 @@ def cmd_convert(args) -> int:
             print(f"错误：{e}", file=sys.stderr)
             return 1
     try:
-        result = engine.convert(text, pinyin=pinyin, answers=answers)
+        result = engine.convert(text, pinyin=pinyin, answers=answers,
+                                substitute_review=substitute_review)
     except ValueError as e:
         print(f"错误：{e}", file=sys.stderr)
         return 1
@@ -181,6 +219,34 @@ def cmd_convert(args) -> int:
                                        ensure_ascii=False, indent=2),
                             encoding="utf-8")
 
+    prop_path = None
+    if result.proposals:
+        prop_path = Path(args.substitute_proposals) if getattr(
+            args, "substitute_proposals", None) else (
+            Path(args.output).with_name("substitute_proposals.json"))
+        prop_path.parent.mkdir(parents=True, exist_ok=True)
+        prop_path.write_text(json.dumps(result.proposals,
+                                        ensure_ascii=False, indent=2),
+                             encoding="utf-8")
+
+    if result.status == "proposals":
+        print(json.dumps({
+            "status": "proposals",
+            "proposals_file": str(prop_path),
+            "proposal_count": len(result.proposals),
+            "audit_file": str(audit_path) if result.audit else None,
+            "audit_counts": result.audit.get("counts") if result.audit else None,
+            "semantic_questions_file": str(sem_path) if sem_path else None,
+            "hint": "替字提案待语境审（v0.4.1）：请执行 agent 逐条核对提案"
+                    "替字的大意是否合该句语境，写 review.json"
+                    "（{\"reviews\": [{\"id\", \"decision\": "
+                    "\"approve\"|\"reject\", \"sense_fit\": \"一句理由\"}]}，"
+                    "approve 必须带非空 sense_fit），后以 "
+                    "--substitute-review 重跑；approve 落字（changes 带 "
+                    "sense_fit 留痕），reject 改钉音保原字。不出成品。",
+        }, ensure_ascii=False))
+        return 2
+
     if result.status == "questions":
         qpath = Path(args.questions or "sound_questions.json")
         qpath.write_text(json.dumps(result.questions, ensure_ascii=False, indent=2),
@@ -190,6 +256,8 @@ def cmd_convert(args) -> int:
             "questions_file": str(qpath),
             "sound_questions_file": str(qpath),
             "question_count": len(result.questions),
+            "proposals_file": str(prop_path) if prop_path else None,
+            "proposal_count": len(result.proposals),
             "audit_file": str(audit_path) if result.audit else None,
             "audit_counts": result.audit.get("counts") if result.audit else None,
             "semantic_questions_file": str(sem_path) if sem_path else None,
@@ -197,7 +265,9 @@ def cmd_convert(args) -> int:
                     "无锁定读音/映射冲突）：请执行 agent 逐条作答（替字或 "
                     "\"ssml\"），写入 answers.json（{\"q0\": \"字\", ...}）"
                     "后以 --answers 重跑；声音层没有 keep。语义待确认在 "
-                    "semantic_questions.json，不挡退出码。",
+                    "semantic_questions.json，不挡退出码。"
+                    "若同时有替字提案（proposals_file），其答案落字前还须"
+                    "过语境审（--substitute-review）。",
         }, ensure_ascii=False))
         return 2
 
@@ -207,6 +277,8 @@ def cmd_convert(args) -> int:
                "changes": len(result.changes),
                "audit_file": str(audit_path) if result.audit else None,
                "audit_counts": result.audit.get("counts") if result.audit else None,
+               "substitute_reviews": (result.audit.get("substitute_reviews")
+                                      if result.audit else None),
                "semantic_questions_file": str(sem_path) if sem_path else None,
                "note": "锁定版以 SSML 版为准：纯文本版里被钉音的字无锁"
                        "（尤其音调型多音字），残余风险在 TTS 引擎，合成请用 SSML 版。"}
@@ -366,6 +438,8 @@ def main(argv: list[str] | None = None) -> int:
     p_conv.add_argument("--audit", help="终检报告 audit.json 输出路径（默认写到输出 TXT 同目录的 audit.json；停在残余问题环节时也写）")
     p_conv.add_argument("--semantic-questions", help="语义待确认清单 JSON 输出路径（默认写到输出 TXT 同目录的 semantic_questions.json；无待确认组时不写）")
     p_conv.add_argument("--answers", help="用户答案 JSON（{\"q0\": \"字\"}；组问题可答替字、\"ssml\" 或 \"keep\"）")
+    p_conv.add_argument("--substitute-proposals", help="替字提案 JSON 输出路径（默认写到输出 TXT 同目录的 substitute_proposals.json；有未审提案时退出码 2、不出成品）")
+    p_conv.add_argument("--substitute-review", help="替字语境审结果 JSON（{\"reviews\": [{\"id\", \"decision\": \"approve\"|\"reject\", \"sense_fit\": \"一句理由\"}]}；approve 须带非空 sense_fit）")
     p_conv.add_argument("--rulings", help="组裁决 JSON（{\"rulings\": [{\"char\", \"reading\", \"action\", \"substitute\"?}]}），启动时写入学习层组记录并本轮生效")
     p_conv.add_argument("--ssml", help="SSML 成品 TXT 输出路径（默认 <输出>.ssml.txt；同行结构，仅 pin 处包 phoneme 标签；有残余问题时不出）")
     p_conv.add_argument("--ssml-hints", help="SSML 钉音清单 JSON 输出路径（默认输出同目录 ssml_hints.json；有残余问题时不出）")

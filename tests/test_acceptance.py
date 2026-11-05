@@ -34,15 +34,38 @@ class Acceptance(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def _approve_yue(self, r1, pinyin):
+        """v0.4.1: the 說→悦 tongjia candidate is a proposal now;
+        approve it in the context review and rerun."""
+        self.assertEqual(r1.status, "proposals", r1.questions)
+        props = [p for p in r1.proposals if p["char"] == "說"]
+        self.assertEqual(len(props), 1, r1.proposals)
+        self.assertEqual(props[0]["candidate"], "悦", props)
+        self.assertEqual(props[0]["via"], "tongjia", props)
+        return self.engine.convert(
+            LUNYU, pinyin=pinyin,
+            substitute_review={props[0]["id"]: {
+                "decision": "approve",
+                "sense_fit": "不亦說乎之說为喜悦义，悦合此句语境"}})
+
     def test_case1a_pinyin_lock_tongjia(self):
-        r = self.engine.convert(LUNYU, pinyin=LUNYU_PY)
+        # supersede v0.4.1 (was: tongjia landed directly in v0.1–v0.4.0):
+        # a tongjia benzi no longer lands on the entry alone — it is
+        # proposed and lands only after the context review approves it
+        # for this sentence (the 中庸 地→第 misfire class).
+        r = self._approve_yue(self.engine.convert(LUNYU, pinyin=LUNYU_PY),
+                              LUNYU_PY)
         self.assertEqual(r.status, "ok")
         self.assertIn("悦", r.output)
         rec = [c for c in r.changes if c["char"] == "說"]
         self.assertTrue(rec and rec[0]["via"] == "tongjia", r.changes)
+        self.assertTrue(rec[0].get("sense_fit"), r.changes)
 
     def test_case1a_tone_marked_pinyin(self):
-        r = self.engine.convert(LUNYU, pinyin=LUNYU_PY_MARKED)
+        # supersede v0.4.1: same context-review gate as case1a above.
+        r = self._approve_yue(
+            self.engine.convert(LUNYU, pinyin=LUNYU_PY_MARKED),
+            LUNYU_PY_MARKED)
         self.assertEqual(r.status, "ok")
         self.assertIn("悦", r.output)
 
@@ -82,12 +105,28 @@ class Acceptance(unittest.TestCase):
                          r.changes)
 
     def test_case3_answer_learn_rerun(self):
+        # supersede v0.4.1 (was: a validated answer landed and was
+        # learned in the same run): a substitute *answer* now passes
+        # the context-review gate like any other substitute — the
+        # answer becomes a proposal; only an approved proposal is
+        # learned and landed. The learned entry then lands directly
+        # on rerun (learned layer is exempt from the gate).
         r1 = self.engine.convert("共")
         self.assertEqual(r1.status, "questions")
         qid = r1.questions[0]["id"]
         r2 = self.engine.convert("共", answers={qid: "供"})
-        self.assertEqual(r2.status, "ok")
-        self.assertEqual(r2.output, "供")
+        self.assertEqual(r2.status, "proposals", r2.questions)
+        props = [p for p in r2.proposals if p["char"] == "共"]
+        self.assertEqual(len(props), 1, r2.proposals)
+        self.assertEqual(props[0]["candidate"], "供", props)
+        self.assertEqual(len(self.learned.entries), 0)
+        r2b = self.engine.convert(
+            "共", answers={qid: "供"},
+            substitute_review={props[0]["id"]: {
+                "decision": "approve",
+                "sense_fit": "共在此语境通供，义合"}})
+        self.assertEqual(r2b.status, "ok", r2b.questions)
+        self.assertEqual(r2b.output, "供")
         self.assertEqual(len(self.learned.entries), 1)
         r3 = self.engine.convert("共")
         self.assertEqual(r3.status, "ok")

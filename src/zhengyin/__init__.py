@@ -8,4 +8,4 @@ Unresolvable characters are never guessed: they become structured
 questions for a human, routed through the calling AI agent.
 """
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"

@@ -51,7 +51,7 @@ def gloss_of(sense: str) -> str:
 
 @dataclass
 class Result:
-    status: str  # "ok" | "questions"
+    status: str  # "ok" | "questions" | "proposals"
     output: str = ""
     changes: list = field(default_factory=list)
     questions: list = field(default_factory=list)
@@ -60,6 +60,8 @@ class Result:
     ssml_output: str = ""
     audit: dict = field(default_factory=dict)
     semantic_questions: list = field(default_factory=list)
+    proposals: list = field(default_factory=list)
+    substitute_reviews: list = field(default_factory=list)
 
 
 class Engine:
@@ -75,9 +77,28 @@ class Engine:
 
     # ------------------------------------------------------------------
     def convert(self, text: str, pinyin: list[str] | None = None,
-                answers: dict | None = None) -> Result:
+                answers: dict | None = None,
+                substitute_review: dict | list | None = None) -> Result:
         d = self.d
         answers = answers or {}
+        # v0.4.1 context-review decisions, keyed by proposal id ("p<han>").
+        # Accepted shapes: {"p3": {"decision": ..., "sense_fit": ...}},
+        # {"reviews": [{...}, ...]} or a bare list of review records.
+        review_map: dict[str, dict] = {}
+        if substitute_review:
+            if isinstance(substitute_review, dict) \
+                    and "reviews" in substitute_review:
+                _items = substitute_review["reviews"]
+            elif isinstance(substitute_review, list):
+                _items = substitute_review
+            elif isinstance(substitute_review, dict):
+                _items = [{"id": _k, **(_v if isinstance(_v, dict) else {})}
+                          for _k, _v in substitute_review.items()]
+            else:
+                _items = []
+            for _r in _items:
+                if isinstance(_r, dict) and _r.get("id"):
+                    review_map[_r["id"]] = _r
         han_pos = [i for i, c in enumerate(text) if is_han(c)]
         n = len(han_pos)
         if pinyin is not None and len(pinyin) != n:
@@ -148,6 +169,8 @@ class Engine:
         ssml_hints: list[dict] = []
         semantic_raw: list[dict] = []
         mapping_rejections: list[dict] = []
+        proposals: list[dict] = []
+        substitute_reviews: list[dict] = []
         final_reading: list[str | None] = [None] * n
 
         for i in range(n):
@@ -270,19 +293,66 @@ class Engine:
                             if c["char"] == ans:
                                 sense = c.get("sense", "")
                                 break
-                        if is_group and tgt is not None:
-                            self.learned.add_group(
-                                ch, tgt, "substitute", ans)
-                        else:
-                            self.learned.add(ch, sentence, eff, ans, sense)
-                        out[han_pos[i]] = ans
-                        final_reading[i] = eff
-                        changes.append({
-                            "index": han_pos[i], "han_index": i, "char": ch,
-                            "to": ans, "reading": eff, "via": "learned",
-                            "reading_via": "answer",
-                            "sense": sense, "ref": "user answer (validated)",
+                        # v0.4.1 context gate: a substitute *answer* has
+                        # passed the sound validation above, but it does
+                        # not land until a context review approves it
+                        # for this sentence (same gate as dictionary
+                        # substitutes). Approval learns + lands with the
+                        # review's sense_fit on the change record;
+                        # rejection pins the original glyph at eff.
+                        _pid = f"p{i}"
+                        _dec = review_map.get(_pid)
+                        if _dec is not None \
+                                and _dec.get("decision") == "approve" \
+                                and (_dec.get("sense_fit") or "").strip():
+                            substitute_reviews.append({
+                                "id": _pid, "han_index": i, "char": ch,
+                                "reading": eff, "candidate": ans,
+                                "via": "answer", "decision": "approve",
+                                "sense_fit": _dec["sense_fit"],
+                                "sentence": sentence,
+                            })
+                            if is_group and tgt is not None:
+                                self.learned.add_group(
+                                    ch, tgt, "substitute", ans)
+                            else:
+                                self.learned.add(ch, sentence, eff, ans, sense)
+                            out[han_pos[i]] = ans
+                            final_reading[i] = eff
+                            changes.append({
+                                "index": han_pos[i], "han_index": i,
+                                "char": ch, "to": ans, "reading": eff,
+                                "via": "learned", "reading_via": "answer",
+                                "sense": sense,
+                                "ref": "user answer (validated)",
+                                "sense_fit": _dec["sense_fit"],
+                            })
+                            return False
+                        if _dec is not None \
+                                and _dec.get("decision") == "reject":
+                            substitute_reviews.append({
+                                "id": _pid, "han_index": i, "char": ch,
+                                "reading": eff, "candidate": ans,
+                                "via": "answer", "decision": "reject",
+                                "kind": "context_review",
+                                "reason": _dec.get("sense_fit") or "",
+                                "sentence": sentence,
+                            })
+                            apply_pin(eff, note=(
+                                "答案替字语境审驳回（context_review）："
+                                f"{_dec.get('sense_fit') or '未说明'}"),
+                                ref="ssml pin (context review, v0.4.1)")
+                            return False
+                        proposals.append({
+                            "id": _pid, "index": han_pos[i], "han_index": i,
+                            "char": ch, "reading": eff, "candidate": ans,
+                            "via": "answer", "sense": sense,
+                            "ref": "user answer (validated), pending "
+                                   "context review",
+                            "sentence": sentence, "prev": prev_s,
+                            "next": next_s,
                         })
+                        final_reading[i] = eff
                         return False
                     reason = f"{reason}；上次答案「{ans}」未通过校验：{fail}"
                 cands = candidates_for(entries_at, podu_at, tgt)
@@ -376,6 +446,86 @@ class Engine:
                                   "sense": sense or "义项待补"})
                 return out_c
 
+            def propose_or_resolve(candidate, reading, via, sense, ref,
+                                   note=""):
+                """v0.4.1 substitute gate （语境审）.
+
+                The caller has already run the hard gate
+                (``strict_substitute_ok``); a candidate that failed it
+                never reaches this function and never becomes a
+                proposal. Here the candidate becomes a *proposal*
+                unless a context review already decided this position:
+
+                * approve (with a non-empty ``sense_fit``) — re-run the
+                  hard gate, then land; the change record carries the
+                  review's ``sense_fit`` as its audit trail;
+                * reject — pin the original glyph (non-default target)
+                  or keep it (default target; the final audit pins a
+                  B/D position itself), recording the rejection under
+                  ``context_review`` in the audit trail;
+                * no decision — record a proposal; the conversion ends
+                  with status "proposals" (exit 2, no product).
+
+                Returns "landed" | "pending" | "pinned" | "kept".
+                """
+                pid = f"p{i}"
+                dec = review_map.get(pid)
+                if dec is not None and dec.get("decision") == "approve" \
+                        and (dec.get("sense_fit") or "").strip():
+                    if not d.strict_substitute_ok(candidate, reading):
+                        record_rejection(reading, candidate, via)
+                        substitute_reviews.append({
+                            "id": pid, "han_index": i, "char": ch,
+                            "reading": reading, "candidate": candidate,
+                            "via": via, "decision": "approve",
+                            "sense_fit": dec["sense_fit"],
+                            "outcome": "hard_recheck_failed",
+                            "sentence": sentence,
+                        })
+                        if reading != default:
+                            apply_pin(reading, note=(
+                                "语境审通过但替字复验未过，驳回改钉音"),
+                                ref="ssml pin (v0.4.1 hard recheck)")
+                            return "pinned"
+                        return "kept"
+                    replace(candidate, reading, via, tsrc or "", sense,
+                            ref, note=note)
+                    changes[-1]["sense_fit"] = dec["sense_fit"]
+                    substitute_reviews.append({
+                        "id": pid, "han_index": i, "char": ch,
+                        "reading": reading, "candidate": candidate,
+                        "via": via, "decision": "approve",
+                        "sense_fit": dec["sense_fit"],
+                        "sentence": sentence,
+                    })
+                    return "landed"
+                if dec is not None and dec.get("decision") == "reject":
+                    substitute_reviews.append({
+                        "id": pid, "han_index": i, "char": ch,
+                        "reading": reading, "candidate": candidate,
+                        "via": via, "decision": "reject",
+                        "kind": "context_review",
+                        "reason": dec.get("sense_fit") or "",
+                        "sentence": sentence,
+                    })
+                    if reading != default:
+                        apply_pin(reading, note=(
+                            "语境审驳回（context_review）："
+                            f"{dec.get('sense_fit') or '未说明'}"),
+                            ref="ssml pin (context review, v0.4.1)")
+                        return "pinned"
+                    return "kept"
+                proposals.append({
+                    "id": pid, "index": han_pos[i], "han_index": i,
+                    "char": ch, "reading": reading, "candidate": candidate,
+                    "via": via, "sense": sense, "ref": ref,
+                    "sentence": sentence, "prev": prev_s, "next": next_s,
+                })
+                return "pending"
+
+            _PROPOSAL_OUTCOME = {"landed": "replaced", "pending": "proposed",
+                                 "pinned": "pinned", "kept": "kept"}
+
             def tongjia_try(tgt, allow_corroboration):
                 """Returns 'replaced' | 'asked' | 'kept' | None (no usable entry).
 
@@ -427,8 +577,11 @@ class Engine:
                                 dict.fromkeys(e.get("sense", "") for e in es if e.get("sense")))
                             ref = "；".join(
                                 dict.fromkeys(e.get("src_ref") or e.get("src", "") for e in es))
-                            replace(b, tgt, "tongjia", tsrc or "default", sense, ref)
-                            return "replaced"
+                            # v0.4.1: corroboration no longer lands
+                            # directly — the benzi becomes a proposal
+                            # and lands only on context-review approval.
+                            return _PROPOSAL_OUTCOME[propose_or_resolve(
+                                b, tgt, "tongjia", sense, ref)]
                         if d.benzi_valid(b, tgt):
                             record_rejection(tgt, b, "tongjia")
                             record_semantic(
@@ -457,8 +610,10 @@ class Engine:
                                 dict.fromkeys(e.get("sense", "") for e in es if e.get("sense")))
                             ref = "；".join(
                                 dict.fromkeys(e.get("src_ref") or e.get("src", "") for e in es))
-                            replace(b, tgt, "tongjia", tsrc or "default", sense, ref)
-                            return "replaced"
+                            # v0.4.1: a tongjia entry alone no longer
+                            # lands — proposal + context review first.
+                            return _PROPOSAL_OUTCOME[propose_or_resolve(
+                                b, tgt, "tongjia", sense, ref)]
                         if d.benzi_valid(b, tgt):
                             record_rejection(tgt, b, "tongjia")
                             apply_pin(tgt, note="通假替字未过终检校验，驳回改钉音",
@@ -484,9 +639,11 @@ class Engine:
                             dict.fromkeys(e.get("sense", "") for e in es if e.get("sense")))
                         ref = "；".join(
                             dict.fromkeys(e.get("src_ref") or e.get("src", "") for e in es))
-                        replace(pick, tgt, "tongjia", tsrc or "default", sense, ref,
-                                note="多本字竞争，由破读语境条目旁证消歧（读音已由用户拼音锁定）")
-                        return "replaced"
+                        # v0.4.1: even a corroborated pick is only a
+                        # proposal until the context review approves it.
+                        return _PROPOSAL_OUTCOME[propose_or_resolve(
+                            pick, tgt, "tongjia", sense, ref,
+                            note="多本字竞争，由破读语境条目旁证消歧（读音已由用户拼音锁定）")]
                 # Evidence gate (non-default, user-pinyin only): when no
                 # competing entry's example matches this sentence and no
                 # corroboration hit, keep the original character instead
@@ -544,6 +701,9 @@ class Engine:
                 if r == "kept":
                     final_reading[i] = raw if raw is not None else target
                     continue
+                if r == "proposed":
+                    final_reading[i] = target
+                    continue
                 if r:
                     continue
                 if target != default:
@@ -557,9 +717,14 @@ class Engine:
                                 record_rejection(target, b, "podu")
                                 continue
                             if b and d.strict_substitute_ok(b, target):
-                                replace(b, target, "podu", tsrc or "",
-                                        gloss_of(e.get("sense", "")),
-                                        e.get("src", ""))
+                                # v0.4.1: verified podu substitutes go
+                                # through the same context-review gate.
+                                _pr = propose_or_resolve(
+                                    b, target, "podu",
+                                    gloss_of(e.get("sense", "")),
+                                    e.get("src", ""))
+                                if _pr == "pending":
+                                    final_reading[i] = target
                                 done = True
                                 break
                     if done:
@@ -596,6 +761,9 @@ class Engine:
                 t = readings[0]
                 r = tongjia_try(t, allow_corroboration=False)
                 if r == "kept":
+                    final_reading[i] = t
+                    continue
+                if r == "proposed":
                     final_reading[i] = t
                     continue
                 if r:
@@ -794,6 +962,13 @@ class Engine:
             det["detected_category"] = _dd["category"] if _dd else det["category"]
         audit["resolutions"] = resolutions
         audit["mapping_rejections"] = mapping_rejections
+        audit["substitute_reviews"] = {
+            "approved": sum(1 for r in substitute_reviews
+                            if r.get("decision") == "approve"),
+            "rejected": sum(1 for r in substitute_reviews
+                            if r.get("decision") == "reject"),
+            "records": substitute_reviews,
+        }
 
         # Group semantic questions by (char, target, kind).
         from collections import OrderedDict as _OD3
@@ -820,11 +995,13 @@ class Engine:
                     "sentence": o["sentence"]} for o in _occs],
             })
 
-        if questions:
-            return Result(status="questions",
-                          questions=self._merge_group_questions(questions),
-                          changes=changes, ssml_hints=ssml_hints,
-                          audit=audit, semantic_questions=semantic_questions)
+        if questions or proposals:
+            return Result(
+                status="questions" if questions else "proposals",
+                questions=self._merge_group_questions(questions),
+                changes=changes, ssml_hints=ssml_hints,
+                audit=audit, semantic_questions=semantic_questions,
+                proposals=proposals, substitute_reviews=substitute_reviews)
 
         # sentence pinyin (converted text, per sentence)
         sent_py: list[tuple[str, str]] = []
@@ -839,7 +1016,8 @@ class Engine:
         return Result(status="ok", output="".join(out), changes=changes,
                       sentence_pinyin=sent_py, ssml_hints=ssml_hints,
                       ssml_output=ssml_output, audit=audit,
-                      semantic_questions=semantic_questions)
+                      semantic_questions=semantic_questions,
+                      substitute_reviews=substitute_reviews)
 
     # ------------------------------------------------------------------
     @staticmethod
