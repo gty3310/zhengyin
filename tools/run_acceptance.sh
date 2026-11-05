@@ -36,12 +36,11 @@ echo "--- pinyin file:"; cat lunyu.out.txt.pinyin.txt
 echo "--- changes:"; cat lunyu.changes.json
 
 echo; echo "===== CASE 1b: 论语 no pinyin -> questions with 悦（喜悦） ====="
-$ZY convert lunyu.txt -o lunyu.out2.txt --questions q1b.json --db "$DB"
-echo "exit=$? (expect 2)"
-echo "--- questions:"; cat q1b.json
-test -f lunyu.out2.txt && echo "!! output TXT should NOT exist" || echo "no output TXT (correct)"
+$ZY convert lunyu.txt -o lunyu.out2.txt --db "$DB"
+echo "exit=$? (expect 0 in v0.4.0: sound pinned; benzi choice in semantic_questions.json)"
+echo "--- semantic questions:"; cat semantic_questions.json
 
-echo; echo "===== CASE 2: 大学 在親民 + pinyin (親=xin1) -> substitute ====="
+echo; echo "===== CASE 2: 大学 在親民 + pinyin (親=xin1) -> v0.4.0 auto-pin (substitute index no longer lands) ====="
 printf '大學之道，在親民，在止於至善' > daxue.txt
 printf 'da4 xue2 zhi1 dao4 zai4 xin1 min2 zai4 zhi3 yu2 zhi4 shan4' > daxue.pinyin.txt
 $ZY convert daxue.txt -o daxue.out.txt --pinyin daxue.pinyin.txt --changes daxue.changes.json --db "$DB"
@@ -68,12 +67,14 @@ export HOME=/tmp/zyhome4
 mkdir -p "$HOME/.zhengyin/data"
 cp /tmp/zyhome/.zhengyin/data/zhengyin.db /tmp/zyhome/.zhengyin/data/manifest.json "$HOME/.zhengyin/data/"
 printf 'gong1' > gong.pinyin.txt
-$ZY convert gong.txt -o gong.out.txt --pinyin gong.pinyin.txt --questions q4.json --db "$DB"
-echo "run1 exit=$? (expect 2)"
+$ZY convert gong.txt -o gong.out.txt --pinyin gong.pinyin.txt --db "$DB"
+echo "run1 exit=$? (expect 0 in v0.4.0: pinned; competition in semantic_questions.json)"; cat semantic_questions.json
+$ZY convert gong.txt -o gong.out.txt --questions q4.json --db "$DB"
+echo "run2 exit=$? (expect 2: residual sound question)"
 QID=$(python3 -c "import json;print(json.load(open('q4.json'))[0]['id'])")
-python3 -c "import json;json.dump({'$QID':'球'}, open('a4.json','w'), ensure_ascii=False)"
-$ZY convert gong.txt -o gong.out.txt --pinyin gong.pinyin.txt --answers a4.json --questions q4b.json --db "$DB"
-echo "run2 exit=$? (expect 2)"; cat q4b.json
+python3 -c "import json;json.dump({'$QID':'供供'}, open('a4.json','w'), ensure_ascii=False)"
+$ZY convert gong.txt -o gong.out.txt --answers a4.json --questions q4b.json --db "$DB"
+echo "run3 exit=$? (expect 2: two-char answer rejected)"; cat q4b.json
 
 echo; echo "===== pinyin count mismatch -> exit 1 ====="
 printf 'xue2 er2' > bad.pinyin.txt
